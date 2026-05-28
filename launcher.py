@@ -20,12 +20,13 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QPushButton, QVBoxLa
                              QHBoxLayout, QLineEdit, QMessageBox, QDialog, QListWidget,
                              QListWidgetItem, QTabWidget, QSpinBox, QCheckBox,
                              QFileDialog, QComboBox, QFrame, QGridLayout, QColorDialog,
-                             QInputDialog, QScrollArea, QSizePolicy, QStackedWidget)
+                             QInputDialog, QScrollArea, QSizePolicy, QStackedWidget,
+                             QFormLayout)
 
 import minecraft as mc
 import themes as themes_mod
 from icons import svg_icon, svg_pixmap
-from widgets import SnakeProgress, BorderOverlay
+from widgets import SnakeProgress, BorderOverlay, ProgressBar, PROGRESS_STYLES
 import profiles as profiles_mod
 
 
@@ -46,6 +47,7 @@ FONTS_DIR   = APP_DIR / "fonts"
 BLOCKS_DIR  = APP_DIR / "assets" / "blocks"
 
 APP_VERSION       = "1.2"
+CONFIG_VERSION    = 2     # Версия структуры config.json (для миграций)
 VERSION_CHECK_URL = ("https://raw.githubusercontent.com/"
                     "YAYRIRZ/SkyPluginsVersion/refs/heads/main/ExelentLauncher")
 TELEGRAM_CONTACT  = "t.me/YAYRIRZ"
@@ -57,7 +59,7 @@ WINDOW_RADIUS = 18     # радиус скругления
 DEFAULT_CONFIG = {
     "username":         "Player",
     "mc_dir":           str(APP_DIR / ".ExelLauncher"),
-    "last_version":     "1.21.4",
+    "last_version":     "1.21.11",
     "ram_mb":           2048,
     "show_snapshots":   False,
     "theme":            "emerald",
@@ -75,6 +77,14 @@ DEFAULT_CONFIG = {
     "sodium_offered_versions": [],
     "ask_sodium":       True,
     "last_profile":     "",
+    "progress_style":   "bar",
+    "ui_style":         "classic",   # "classic" | "lunar"
+    "sidebar_width":    68,          # ширина sidebar в Lunar (px)
+    "border_width":     6,           # ширина обводки окна (px)
+    # Java overrides: {mc_version: java_path} — если есть, запускаем без вопросов
+    "java_overrides":   {},
+    "config_version":   CONFIG_VERSION,
+    "launcher_version": APP_VERSION,
 }
 
 CUSTOM_FONT_FAMILY = "Segoe UI"
@@ -129,6 +139,10 @@ def get_font(size: int = 10, weight: QFont.Weight = QFont.Weight.Normal) -> QFon
 # ═══════════════════════════════════════════════════════════════
 
 def load_config() -> dict:
+    """
+    Загружает config.json. Применяет миграции по полю "config_version".
+    Если поле отсутствует → версия 1 (старая). Обновляем до CONFIG_VERSION.
+    """
     cfg = dict(DEFAULT_CONFIG)
     if CONFIG_FILE.exists():
         try:
@@ -138,10 +152,38 @@ def load_config() -> dict:
                 cfg.update(loaded)
         except Exception:
             pass
+
+    # Чистка старых полей
     cfg.pop("servers", None)
     cfg.pop("dev_mode", None)
     if not isinstance(cfg.get("sodium_offered_versions"), list):
         cfg["sodium_offered_versions"] = []
+    if not isinstance(cfg.get("java_overrides"), dict):
+        cfg["java_overrides"] = {}
+
+    # ── Миграции по версии конфига ──
+    user_ver = int(cfg.get("config_version", 1))
+    migrated = False
+
+    # v1 → v2: добавлены ui_style, progress_style, java_overrides;
+    #          last_version обновляется с 1.21.4 на 1.21.11
+    if user_ver < 2:
+        if cfg.get("last_version") in (None, "", "1.21.4"):
+            cfg["last_version"] = DEFAULT_CONFIG["last_version"]
+        cfg.setdefault("ui_style",       DEFAULT_CONFIG["ui_style"])
+        cfg.setdefault("progress_style", DEFAULT_CONFIG["progress_style"])
+        migrated = True
+
+    # Будущие миграции: if user_ver < 3: ...
+
+    cfg["config_version"] = CONFIG_VERSION
+    cfg["launcher_version"] = APP_VERSION   # для информации
+
+    if migrated:
+        try:
+            save_config(cfg)
+        except Exception:
+            pass
     return cfg
 
 
@@ -263,17 +305,31 @@ class BlockDownloadThread(QThread):
 
 def block_pixmap(key: str, size: int) -> QPixmap:
     """
-    Пиксмап блока:
-      • Если файл есть — берём ВЕРХНИЙ КВАДРАТ (для анимаций типа 16x32)
-        и масштабируем пиксельно (NearestNeighbor).
-      • Иначе — SVG-fallback.
+    Пиксмап блока для заголовков секций.
+    Берём из локального кэша assets/blocks/<key>.png, ИЛИ напрямую из
+    скачанных MC-ассетов assets/mc/textures/block/...
     """
     path = BLOCKS_DIR / f"{key}.png"
     if path.exists():
         pix = QPixmap(str(path))
         if not pix.isNull():
             pix = _square_crop_top(pix)
-            return _scaled_pixel(pix, size)
+            return pix.scaled(size, size,
+                              Qt.AspectRatioMode.IgnoreAspectRatio,
+                              Qt.TransformationMode.FastTransformation)
+    # Пробуем взять из MC-ассетов напрямую
+    mc_map = {
+        "furnace":  "textures/block/furnace_front_on.png",
+        "crafting": "textures/block/crafting_table_front.png",
+        "diamond":  "textures/block/diamond_block.png",
+        "redstone": "textures/block/redstone_ore.png",
+    }
+    rel = mc_map.get(key, "")
+    if rel:
+        pix = themes_mod.load_mc_pixmap(rel, size, pixel_art=True)
+        if pix is not None and not pix.isNull():
+            return pix
+    # Финальный fallback — цветной квадратик через svg_pixmap
     fallback = {
         "furnace":  ("settings",  "#cc7733"),
         "crafting": ("category",  "#aa6633"),
@@ -342,8 +398,9 @@ def _input_ss(t: dict) -> str:
             color: {t['text']};
             border: 1.5px solid {t['primary_dark']};
             border-radius: 10px;
-            padding: 6px 10px;
-            min-height: 26px;
+            padding: 4px 10px;
+            min-height: 28px;
+            max-height: 36px;
             font: 10pt '{F()}';
         }}
         QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{
@@ -618,24 +675,31 @@ class ThemedDialog(QDialog):
         t = self.theme
         r, g, b = t["glow_rgb"]
         w = QFrame()
+        # Жёстко фиксируем высоту чтобы иконка точно не обрезалась.
+        # 40px = 24 иконка + 8 верх + 8 низ + запас.
+        w.setFixedHeight(42)
+        # ВАЖНО: padding убираем из CSS, иначе layout считает размеры неправильно.
+        # Только background + border-left.
         w.setStyleSheet(
             f"QFrame{{background:rgba({r},{g},{b},0.10);"
             f"border-left:3px solid {t['accent']};"
-            f"border-radius:5px; padding:3px 8px;}}")
+            f"border-radius:5px;}}")
         lay = QHBoxLayout(w)
-        lay.setContentsMargins(4, 2, 4, 2)
-        lay.setSpacing(8)
+        lay.setContentsMargins(10, 6, 10, 6)
+        lay.setSpacing(10)
         if block_key:
             ico = QLabel()
-            ico.setPixmap(block_pixmap(block_key, 22))
-            ico.setFixedSize(26, 26)
+            ico.setPixmap(block_pixmap(block_key, 24))
+            ico.setFixedSize(28, 28)
+            ico.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            ico.setScaledContents(False)
             ico.setStyleSheet("background:transparent; border:none;")
-            lay.addWidget(ico)
+            lay.addWidget(ico, 0, Qt.AlignmentFlag.AlignVCenter)
         lbl = QLabel(text)
         lbl.setStyleSheet(
-            f"font:700 9pt '{F()}'; color:{t['accent']};"
+            f"font:700 10pt '{F()}'; color:{t['accent']};"
             f"background:transparent; border:none;")
-        lay.addWidget(lbl)
+        lay.addWidget(lbl, 0, Qt.AlignmentFlag.AlignVCenter)
         lay.addStretch()
         return w
 
@@ -857,14 +921,64 @@ class ModrinthDownloadThread(QThread):
             self.failed.emit(str(ex))
 
 
+# Глобальный пул "осиротевших" IconLoader-потоков.
+# Когда карточка ProjectCard удаляется раньше чем поток успел завершить
+# urlopen() — мы НЕ можем разрушить QThread (Qt ругается фаталкой).
+# Поэтому "паркуем" поток здесь: держим reference, отсоединяем от родителя,
+# и удаляем из пула когда finished. Тогда Qt спокойно его утилизирует.
+_PENDING_LOADERS: list = []
+
+
+def _park_loader(th):
+    """Положить поток в пул и автоматически удалить когда завершится."""
+    if th is None:
+        return
+    try:
+        th.setParent(None)  # отвязываем от мёртвой карточки
+    except Exception:
+        pass
+    if th in _PENDING_LOADERS:
+        return
+    _PENDING_LOADERS.append(th)
+
+    def _cleanup():
+        try:
+            _PENDING_LOADERS.remove(th)
+        except ValueError:
+            pass
+
+    try:
+        th.finished.connect(_cleanup)
+    except Exception:
+        pass
+
+
 class IconLoaderThread(QThread):
+    """
+    Загружает иконку проекта Modrinth в фоне.
+    Если карточка умирает раньше — поток отправляется в _PENDING_LOADERS
+    и тихо завершается сам, без эмита сигнала и без краша Qt.
+    """
     done = pyqtSignal(object, object)
 
-    def __init__(self, card_id, url: str):
-        super().__init__()
+    def __init__(self, card_id, url: str, parent=None):
+        super().__init__(parent)
         self.card_id = card_id
         self.url = url
+        self._alive = True
         self.setObjectName("IconLoader")
+
+    def cancel(self):
+        """Помечает поток как ненужный — сигнал больше не эмитится."""
+        self._alive = False
+
+    def _safe_emit(self, pix):
+        if not self._alive:
+            return
+        try:
+            self.done.emit(self.card_id, pix)
+        except Exception:
+            pass
 
     def run(self):
         try:
@@ -878,11 +992,11 @@ class IconLoaderThread(QThread):
                 pix = pix.scaled(52, 52,
                                  Qt.AspectRatioMode.KeepAspectRatio,
                                  Qt.TransformationMode.SmoothTransformation)
-                self.done.emit(self.card_id, pix)
+                self._safe_emit(pix)
                 return
         except Exception:
             pass
-        self.done.emit(self.card_id, None)
+        self._safe_emit(None)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -890,12 +1004,25 @@ class IconLoaderThread(QThread):
 # ═══════════════════════════════════════════════════════════════
 
 class VersionPickerDialog(ThemedDialog):
-    def __init__(self, versions, installed, current, theme, parent=None):
-        super().__init__(theme, "Выбор версии", parent, width=440, height=560)
+    """
+    Список версий + профилей.
+    Каждый элемент имеет:
+      UserRole       = id версии (для запуска)
+      UserRole + 1   = тип ('profile' / 'version')
+      UserRole + 2   = имя профиля (если это профиль)
+    """
+
+    ROLE_KIND = Qt.ItemDataRole.UserRole + 1
+    ROLE_PROFILE_NAME = Qt.ItemDataRole.UserRole + 2
+
+    def __init__(self, versions, installed, current, theme,
+                 profiles_list: list = None, parent=None):
+        super().__init__(theme, "Выбор версии", parent, width=480, height=600)
         self.selected = current
+        self.selected_profile = None  # имя профиля если выбран профиль
 
         srch = QLineEdit()
-        srch.setPlaceholderText("Поиск: 1.20, fabric...")
+        srch.setPlaceholderText("Поиск: 1.20, fabric, MyPack...")
         srch.setStyleSheet(_input_ss(theme))
         self.content_layout.addWidget(srch)
 
@@ -903,6 +1030,35 @@ class VersionPickerDialog(ThemedDialog):
         self.lst.setStyleSheet(_list_ss(theme))
         self.content_layout.addWidget(self.lst, 1)
 
+        t = theme
+
+        # ── 1. ПРОФИЛИ (сверху) ──
+        profiles_list = profiles_list or []
+        if profiles_list:
+            hdr = QListWidgetItem("─── ПРОФИЛИ ───")
+            hdr.setFlags(Qt.ItemFlag.NoItemFlags)  # некликабельный
+            hdr.setForeground(QColor(t["accent"]))
+            self.lst.addItem(hdr)
+
+            for prof in profiles_list:
+                name   = prof.get("name", "?")
+                base   = prof.get("base", "?")
+                loader = prof.get("loader", "vanilla")
+                ver_id = prof.get("version_id") or base
+                label  = f"  {name}   ({loader} · MC {base})"
+                it = QListWidgetItem(label)
+                it.setData(Qt.ItemDataRole.UserRole, ver_id)
+                it.setData(self.ROLE_KIND, "profile")
+                it.setData(self.ROLE_PROFILE_NAME, name)
+                it.setForeground(QColor(t["accent_light"]))
+                self.lst.addItem(it)
+
+            sep = QListWidgetItem("─── ВЕРСИИ ───")
+            sep.setFlags(Qt.ItemFlag.NoItemFlags)
+            sep.setForeground(QColor(t["accent"]))
+            self.lst.addItem(sep)
+
+        # ── 2. ОБЫЧНЫЕ ВЕРСИИ ──
         for v in versions:
             vid = v.get("id", "")
             suffix = "  [установлена]" if vid in installed else ""
@@ -910,6 +1066,7 @@ class VersionPickerDialog(ThemedDialog):
             it = QListWidgetItem(
                 vid + (f" [{typ}]" if typ != "release" else "") + suffix)
             it.setData(Qt.ItemDataRole.UserRole, vid)
+            it.setData(self.ROLE_KIND, "version")
             self.lst.addItem(it)
             if vid == current:
                 self.lst.setCurrentItem(it)
@@ -927,13 +1084,20 @@ class VersionPickerDialog(ThemedDialog):
         text = text.lower()
         for i in range(self.lst.count()):
             it = self.lst.item(i)
-            it.setHidden(text not in it.data(Qt.ItemDataRole.UserRole).lower())
+            if not (it.flags() & Qt.ItemFlag.ItemIsSelectable):
+                continue  # заголовки секций не фильтруем
+            data = it.data(Qt.ItemDataRole.UserRole) or ""
+            name = it.data(self.ROLE_PROFILE_NAME) or ""
+            it.setHidden(text not in data.lower() and text not in name.lower())
 
     def _accept(self):
         it = self.lst.currentItem()
-        if it:
-            self.selected = it.data(Qt.ItemDataRole.UserRole)
-            self.accept()
+        if not it or not (it.flags() & Qt.ItemFlag.ItemIsSelectable):
+            return
+        self.selected = it.data(Qt.ItemDataRole.UserRole)
+        if it.data(self.ROLE_KIND) == "profile":
+            self.selected_profile = it.data(self.ROLE_PROFILE_NAME)
+        self.accept()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1234,19 +1398,43 @@ class ProjectCard(QFrame):
 
         icon_url = data.get("icon_url", "")
         if icon_url:
-            self._icon_thread = IconLoaderThread(id(self), icon_url)
+            self._icon_thread = IconLoaderThread(id(self), icon_url, parent=self)
             self._icon_thread.done.connect(self._on_icon)
             self._icon_thread.start()
 
     def _on_icon(self, _cid, pix):
-        if pix and not pix.isNull():
-            self._ico.setPixmap(pix)
+        # Виджет мог уже умереть — проверяем
+        try:
+            if pix and not pix.isNull():
+                self._ico.setPixmap(pix)
+        except RuntimeError:
+            # C++ object deleted
+            return
+        except Exception:
+            pass
         self._icon_thread = None
 
+    def stop_thread(self):
+        """
+        Безопасная остановка фоновой загрузки иконки.
+        Если поток ещё в urlopen — паркуем его в глобальный пул, чтобы Qt
+        не словил фаталку 'QThread destroyed while still running'.
+        """
+        t = self._icon_thread
+        self._icon_thread = None
+        if t is None:
+            return
+        try:
+            t.cancel()
+        except Exception:
+            pass
+        if t.isRunning():
+            # Не разрушаем Python-объект потока — паркуем его
+            _park_loader(t)
+        # Если уже не running — обычный сборщик мусора уберёт
+
     def closeEvent(self, e):
-        if self._icon_thread and self._icon_thread.isRunning():
-            self._icon_thread.quit()
-            self._icon_thread.wait(300)
+        self.stop_thread()
         super().closeEvent(e)
 
 
@@ -1300,6 +1488,13 @@ class ResultsPage(QWidget):
             item = self._grid.takeAt(0)
             w = item.widget()
             if w:
+                # Если это карточка — глушим её фоновый поток
+                if isinstance(w, ProjectCard):
+                    try:
+                        w.stop_thread()
+                    except Exception:
+                        pass
+                w.setParent(None)
                 w.deleteLater()
         self._empty_lbl.hide()
 
@@ -1743,10 +1938,20 @@ class ModrinthBrowser(QWidget):
         QMessageBox.critical(self, "Ошибка", err)
 
     def shutdown(self):
+        # 1. Гасим поиск/скачивание
         for th in (self._search_thread, self._dl_thread):
             if th and th.isRunning():
                 th.quit()
                 th.wait(400)
+        # 2. Гасим все карточки во всех страницах (там сидят IconLoaderThread)
+        try:
+            for page in getattr(self, "_pages", {}).values():
+                if hasattr(page, "clear"):
+                    page.clear()
+            if hasattr(self, "_cat_results"):
+                self._cat_results.clear()
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2014,6 +2219,13 @@ class CustomizationDialog(ThemedDialog):
                 self.tabs.removeTab(0)
                 if w in self._pages:
                     self._pages.remove(w)
+                # ВАЖНО: сначала останавливаем все потоки внутри браузера
+                if hasattr(w, "shutdown"):
+                    try:
+                        w.shutdown()
+                    except Exception:
+                        pass
+                w.setParent(None)
                 w.deleteLater()
             except Exception:
                 pass
@@ -2051,11 +2263,21 @@ class CustomizationDialog(ThemedDialog):
             self._reload_profiles()
 
     def closeEvent(self, e):
-        for p in self._pages:
+        # Останавливаем все ModrinthBrowser'ы и LocalModsPage
+        for p in list(self._pages):
             try:
-                p.shutdown()
+                if hasattr(p, "shutdown"):
+                    p.shutdown()
             except Exception:
                 pass
+        # Дополнительно сами явно ссылающиеся
+        for attr in ("rp_page", "sh_page", "local_page", "mods_page"):
+            obj = getattr(self, attr, None)
+            if obj is not None and hasattr(obj, "shutdown"):
+                try:
+                    obj.shutdown()
+                except Exception:
+                    pass
         super().closeEvent(e)
 
 
@@ -2064,11 +2286,11 @@ class CustomizationDialog(ThemedDialog):
 # ═══════════════════════════════════════════════════════════════
 
 class SodiumOfferDialog(ThemedDialog):
-    def __init__(self, theme: dict, mc_version: str, mc_dir: Path,
+    def __init__(self, theme: dict, mc_version: str, mods_dir: Path,
                  is_fabric: bool, parent=None):
         super().__init__(theme, "Оптимизация", parent, width=480, height=340)
         self._mc_version = mc_version
-        self._mc_dir     = Path(mc_dir)
+        self._mods_dir   = Path(mods_dir)
         self._is_fabric  = is_fabric
         self._thread = None
         self._build()
@@ -2123,13 +2345,12 @@ class SodiumOfferDialog(ThemedDialog):
             self.add_button_row(skip)
 
     def _install(self):
-        mods_dir = self._mc_dir / "mods"
-        mods_dir.mkdir(parents=True, exist_ok=True)
+        self._mods_dir.mkdir(parents=True, exist_ok=True)
         self._prog.show()
         self._prog.setIndeterminate(True)
         self._st.setText("Поиск на Modrinth...")
         self._thread = ModrinthDownloadThread(
-            "sodium", self._mc_version, mods_dir, "fabric")
+            "sodium", self._mc_version, self._mods_dir, "fabric")
         self._thread.progress.connect(
             lambda p, s: (self._prog.setValue(p), self._st.setText(s)))
         self._thread.ok.connect(self._ok)
@@ -2193,8 +2414,11 @@ class SettingsDialog(ThemedDialog):
         self.theme      = theme
         self._online    = online
         self.result_cfg = dict(cfg)
-        super().__init__(theme, "Настройки", parent, width=760, height=680)
+        super().__init__(theme, "Настройки", parent, width=760, height=720)
         self._build()
+        # Даём Qt построить layout до показа
+        for _ in range(3):
+            QApplication.processEvents()
 
     def _build(self):
         tabs = QTabWidget()
@@ -2217,21 +2441,53 @@ class SettingsDialog(ThemedDialog):
         return self.make_label(text)
 
     def _tab_launcher(self) -> QWidget:
+        """Вкладка Лаунчер. Через QFormLayout + scroll area, чтобы поля
+        не наезжали даже если контента много."""
+        # Внешний контейнер — scroll, внутри сам контент
+        outer = QWidget(); outer.setStyleSheet("background:transparent;")
+        outer_lay = QVBoxLayout(outer)
+        outer_lay.setContentsMargins(0, 0, 0, 0)
+        outer_lay.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setStyleSheet(
+            f"QScrollArea{{background:transparent; border:none;}}"
+            f"{_sb_ss(self.theme)}")
+        outer_lay.addWidget(scroll)
+
         w = QWidget(); w.setStyleSheet("background:transparent;")
-        lay = QVBoxLayout(w); lay.setSpacing(6)
+        scroll.setWidget(w)
+
+        lay = QVBoxLayout(w)
+        lay.setSpacing(12)
+        lay.setContentsMargins(8, 8, 8, 8)
         iss = _input_ss(self.theme)
 
+        def _form() -> QFormLayout:
+            f = QFormLayout()
+            f.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            f.setFormAlignment(Qt.AlignmentFlag.AlignTop)
+            f.setHorizontalSpacing(14)
+            f.setVerticalSpacing(10)
+            f.setContentsMargins(6, 6, 6, 6)
+            f.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+            return f
+
+        # ── Производительность ──
         lay.addWidget(self._sh("Производительность", "furnace"))
-        g1 = QGridLayout(); g1.setSpacing(6)
+        f1 = _form()
         self.ram = QSpinBox()
         self.ram.setRange(512, 32768); self.ram.setSingleStep(512)
         self.ram.setValue(int(self.cfg.get("ram_mb", 2048)))
         self.ram.setSuffix(" MB"); self.ram.setStyleSheet(iss)
-        g1.addWidget(self._lbl("RAM"), 0, 0); g1.addWidget(self.ram, 0, 1)
-        lay.addLayout(g1)
+        f1.addRow(self._lbl("RAM:"), self.ram)
+        lay.addLayout(f1)
 
+        # ── Интерфейс ──
         lay.addWidget(self._sh("Интерфейс", "crafting"))
-        g2 = QGridLayout(); g2.setSpacing(6)
+        f2 = _form()
         self.width_sp = QSpinBox()
         self.width_sp.setRange(760, 2400)
         self.width_sp.setValue(int(self.cfg.get("window_width", 1000)))
@@ -2247,11 +2503,12 @@ class SettingsDialog(ThemedDialog):
         self.panel.setCurrentIndex(
             max(0, self.panel.findData(self.cfg.get("panel_position", "bottom"))))
         self.panel.setStyleSheet(iss)
-        g2.addWidget(self._lbl("Ширина"), 0, 0); g2.addWidget(self.width_sp, 0, 1)
-        g2.addWidget(self._lbl("Высота"), 1, 0); g2.addWidget(self.height_sp, 1, 1)
-        g2.addWidget(self._lbl("Панель"), 2, 0); g2.addWidget(self.panel, 2, 1)
-        lay.addLayout(g2)
+        f2.addRow(self._lbl("Ширина:"), self.width_sp)
+        f2.addRow(self._lbl("Высота:"), self.height_sp)
+        f2.addRow(self._lbl("Панель:"), self.panel)
+        lay.addLayout(f2)
 
+        # ── Опции ──
         lay.addWidget(self._sh("Опции", "diamond"))
         self.snap = QCheckBox("Показывать снапшоты")
         self.snap.setChecked(bool(self.cfg.get("show_snapshots")))
@@ -2265,6 +2522,54 @@ class SettingsDialog(ThemedDialog):
         lay.addWidget(self.snap)
         lay.addWidget(self.news_cb)
         lay.addWidget(self.ask_sodium_cb)
+        lay.addSpacing(8)
+
+        # ── Стиль интерфейса (classic / lunar) ──
+        lay.addWidget(self._sh("Стиль интерфейса", "crafting"))
+        f3 = QFormLayout()
+        f3.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        f3.setHorizontalSpacing(14)
+        f3.setVerticalSpacing(10)
+        f3.setContentsMargins(6, 6, 6, 6)
+        f3.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.ui_style_cb = QComboBox()
+        self.ui_style_cb.addItem("Классическая (центр)", "classic")
+        self.ui_style_cb.addItem("Lunar (sidebar слева)", "lunar")
+        cur_ui = self.cfg.get("ui_style", "classic")
+        idx_ui = self.ui_style_cb.findData(cur_ui)
+        if idx_ui >= 0:
+            self.ui_style_cb.setCurrentIndex(idx_ui)
+        self.ui_style_cb.setStyleSheet(iss)
+        f3.addRow(self._lbl("Компоновка:"), self.ui_style_cb)
+        lay.addLayout(f3)
+
+        # Стиль прогресс-бара
+        lay.addWidget(self._sh("Стиль загрузки", "redstone"))
+        f4 = QFormLayout()
+        f4.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        f4.setHorizontalSpacing(14)
+        f4.setVerticalSpacing(10)
+        f4.setContentsMargins(6, 6, 6, 6)
+        f4.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.progress_style_cb = QComboBox()
+        for sid, sname in PROGRESS_STYLES:
+            self.progress_style_cb.addItem(sname, sid)
+        cur = self.cfg.get("progress_style", "bar")
+        idx = self.progress_style_cb.findData(cur)
+        if idx >= 0:
+            self.progress_style_cb.setCurrentIndex(idx)
+        self.progress_style_cb.setStyleSheet(iss)
+        f4.addRow(self._lbl("Анимация:"), self.progress_style_cb)
+        lay.addLayout(f4)
+        # Превью прогресса (живая анимация)
+        self.progress_preview = ProgressBar(
+            self.theme, style_name=cur)
+        self.progress_preview.setIndeterminate(True)
+        lay.addWidget(self.progress_preview)
+        self.progress_style_cb.currentIndexChanged.connect(
+            lambda _i: self.progress_preview.setStyleName(
+                self.progress_style_cb.currentData()))
+        lay.addSpacing(8)
 
         lay.addWidget(self._sh("Фон", "redstone"))
         bgr = QHBoxLayout()
@@ -2281,12 +2586,52 @@ class SettingsDialog(ThemedDialog):
         lay.addWidget(self.bg_blur)
 
         lay.addStretch()
-        return w
+        return outer
 
     def _tab_style(self) -> QWidget:
+        # Scroll-обёртка для предотвращения наезжания контента
+        outer = QWidget(); outer.setStyleSheet("background:transparent;")
+        outer_lay = QVBoxLayout(outer)
+        outer_lay.setContentsMargins(0, 0, 0, 0)
+        outer_lay.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setStyleSheet(
+            f"QScrollArea{{background:transparent; border:none;}}"
+            f"{_sb_ss(self.theme)}")
+        outer_lay.addWidget(scroll)
+
         w = QWidget(); w.setStyleSheet("background:transparent;")
-        lay = QVBoxLayout(w); lay.setSpacing(6)
+        scroll.setWidget(w)
+        lay = QVBoxLayout(w); lay.setSpacing(10); lay.setContentsMargins(8, 8, 8, 8)
         iss = _input_ss(self.theme)
+
+        # ── Размеры окна и сайдбара (новая секция) ──
+        lay.addWidget(self._sh("Размеры элементов", "redstone"))
+        f_sz = QFormLayout()
+        f_sz.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        f_sz.setHorizontalSpacing(14)
+        f_sz.setVerticalSpacing(10)
+        f_sz.setContentsMargins(6, 6, 6, 6)
+        f_sz.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+
+        self.border_sp = QSpinBox()
+        self.border_sp.setRange(2, 16)
+        self.border_sp.setValue(int(self.cfg.get("border_width", 6)))
+        self.border_sp.setSuffix(" px")
+        self.border_sp.setStyleSheet(iss)
+        f_sz.addRow(self._lbl("Обводка окна:"), self.border_sp)
+
+        self.sidebar_sp = QSpinBox()
+        self.sidebar_sp.setRange(48, 120)
+        self.sidebar_sp.setValue(int(self.cfg.get("sidebar_width", 68)))
+        self.sidebar_sp.setSuffix(" px")
+        self.sidebar_sp.setStyleSheet(iss)
+        f_sz.addRow(self._lbl("Sidebar (Lunar):"), self.sidebar_sp)
+        lay.addLayout(f_sz)
+        lay.addSpacing(8)
 
         lay.addWidget(self._sh("Тема", "crafting"))
         g1 = QGridLayout(); g1.setSpacing(6)
@@ -2301,7 +2646,6 @@ class SettingsDialog(ThemedDialog):
         self.item_combo = QComboBox()
         for iid, info in themes_mod.ITEMS.items():
             self.item_combo.addItem(info["name"], iid)
-        self.item_combo.addItem("По URL", "custom")
         self.item_combo.setCurrentIndex(
             max(0, self.item_combo.findData(self.cfg.get("item", "emerald"))))
         self.item_combo.setStyleSheet(iss)
@@ -2348,11 +2692,23 @@ class SettingsDialog(ThemedDialog):
             self.color_edits[key] = edit
         scroll.setWidget(cw)
         lay.addWidget(scroll, 1)
-        return w
+        return outer
 
     def _tab_java(self) -> QWidget:
+        outer = QWidget(); outer.setStyleSheet("background:transparent;")
+        outer_lay = QVBoxLayout(outer)
+        outer_lay.setContentsMargins(0, 0, 0, 0)
+        outer_lay.setSpacing(0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setStyleSheet(
+            f"QScrollArea{{background:transparent; border:none;}}"
+            f"{_sb_ss(self.theme)}")
+        outer_lay.addWidget(scroll)
         w = QWidget(); w.setStyleSheet("background:transparent;")
-        lay = QVBoxLayout(w); lay.setSpacing(6)
+        scroll.setWidget(w)
+        lay = QVBoxLayout(w); lay.setSpacing(10); lay.setContentsMargins(8, 8, 8, 8)
         iss = _input_ss(self.theme)
 
         lay.addWidget(self._sh("Путь к Java", "furnace"))
@@ -2407,7 +2763,7 @@ class SettingsDialog(ThemedDialog):
         lay.addWidget(about)
 
         lay.addStretch()
-        return w
+        return outer
 
     def _pick_bg(self):
         f, _ = QFileDialog.getOpenFileName(
@@ -2442,6 +2798,10 @@ class SettingsDialog(ThemedDialog):
             "item":            self.item_combo.currentData(),
             "custom_item_url": self.icon_url.text().strip(),
             "java_path":       self.java_edit.text().strip(),
+            "progress_style":  self.progress_style_cb.currentData() or "bar",
+            "ui_style":        self.ui_style_cb.currentData() or "classic",
+            "border_width":    int(self.border_sp.value()),
+            "sidebar_width":   int(self.sidebar_sp.value()),
             "custom_colors":   {
                 k: e.text().strip()
                 for k, e in self.color_edits.items()
@@ -2542,9 +2902,12 @@ class LauncherWindow(QWidget):
         self._apply_icon()
         self._build_ui()
 
-        # Толстая обводка ПОВЕРХ всего
-        self._overlay = BorderOverlay(self.theme, self.BORDER, self.RADIUS, self)
+        # Толстая обводка ПОВЕРХ всего. Ширину берём из cfg.
+        border_w = int(self.cfg.get("border_width", self.BORDER))
+        self._overlay = BorderOverlay(self.theme, border_w, self.RADIUS, self)
         self._overlay.setGeometry(self.rect())
+        # КЛЮЧЕВОЕ: raise_() поднимает overlay над всеми дочерними виджетами,
+        # включая sidebar в Lunar — рамка всегда поверх содержимого
         self._overlay.raise_()
 
         self._center()
@@ -2661,23 +3024,15 @@ class LauncherWindow(QWidget):
 
     # ── UI ──
     def _item_pix(self, size: int) -> QPixmap:
-        """
-        Возвращает большую иконку выбранного item.
-        Если файл — это PNG-апскейл MC-текстуры (квадрат 256х256), масштабируем
-        SmoothTransformation; иначе грузим через svg_pixmap.
-        """
+        """Большая иконка выбранного item — квадрат size×size, пиксельный апскейл."""
         try:
-            path = themes_mod.get_item_path(self.cfg.get("item", "emerald"))
-            if path.exists():
-                src = QPixmap(str(path))
-                if not src.isNull():
-                    src = _square_crop_top(src)
-                    return src.scaled(
-                        size, size,
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation)
+            pix = themes_mod.get_item_pixmap(
+                self.cfg.get("item", "diamond"), size)
+            if not pix.isNull():
+                return pix
         except Exception:
             pass
+        # Самый крайний случай
         return svg_pixmap("rocket", size, self.theme["accent"])
 
     def _clear_layout(self):
@@ -2688,8 +3043,6 @@ class LauncherWindow(QWidget):
     def _build_ui(self):
         self._clear_layout()
         root = QVBoxLayout(self)
-        # КЛЮЧЕВОЕ: контент НЕ заходит за рамку.
-        # Отступ = ширине обводки, чтобы панели/баннеры не перекрывали её.
         b = self.BORDER
         root.setContentsMargins(b, b, b, b)
         root.setSpacing(0)
@@ -2706,6 +3059,16 @@ class LauncherWindow(QWidget):
                 f"border-bottom:1px solid #ffaa55; padding:6px;")
             root.addWidget(ob)
 
+        ui_style = self.cfg.get("ui_style", "classic")
+        if ui_style == "lunar":
+            root.addWidget(self._build_lunar_body(), 1)
+            # КЛЮЧЕВОЕ: после построения lunar body поднимаем overlay
+            # ещё раз — он должен быть НА САМОМ ВЕРХУ всех виджетов
+            if hasattr(self, "_overlay"):
+                self._overlay.raise_()
+            return
+
+        # Classic layout
         pos = self.cfg.get("panel_position", "bottom")
         if pos in ("left", "right"):
             body = QHBoxLayout()
@@ -2726,6 +3089,219 @@ class LauncherWindow(QWidget):
             else:
                 root.addWidget(self._content_area(), 1)
                 root.addWidget(self._control_panel(False))
+        # После построения главного layout поднимаем overlay
+        if hasattr(self, "_overlay"):
+            self._overlay.raise_()
+
+    # ───────────────────────────────────────────────────────────
+    #  LUNAR LAYOUT — sidebar слева + большая центральная зона
+    # ───────────────────────────────────────────────────────────
+
+    def _build_lunar_body(self) -> QWidget:
+        t = self.theme
+        wrap = QWidget()
+        body = QHBoxLayout(wrap)
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+
+        # ── SIDEBAR слева (узкий, с иконками) ──
+        side = QFrame()
+        sw = int(self.cfg.get("sidebar_width", 68))
+        side.setFixedWidth(sw)
+        # ВАЖНО: оставляем место СЛЕВА равное толщине обводки
+        # чтобы обводка не перекрывалась sidebar'ом
+        side.setStyleSheet(
+            f"QFrame{{background:rgba(8,12,8,230);"
+            f"border-right:1px solid {t['primary_dark']};"
+            f"border-top-left-radius:0px;"
+            f"border-bottom-left-radius:0px;}}")
+        sl = QVBoxLayout(side)
+        sl.setContentsMargins(0, 12, 0, 12)
+        sl.setSpacing(6)
+        sl.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        # Логотип сверху
+        logo = QLabel()
+        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        logo.setPixmap(self._item_pix(40))
+        logo.setStyleSheet("background:transparent;")
+        sl.addWidget(logo)
+        sl.addSpacing(16)
+
+        # Вертикальные кнопки-иконки
+        sidebar_btns = [
+            ("rocket",   "Главная",      lambda: None),
+            ("puzzle",   "Кастомизация", self._show_customization),
+            ("package",  "Профили",      self._new_profile_btn),
+            ("folder",   "Папка",        lambda: open_folder(self.mc_dir)),
+        ]
+        for ico, tip, cb in sidebar_btns:
+            btn = self._lunar_side_btn(ico, tip)
+            btn.clicked.connect(cb)
+            sl.addWidget(btn)
+
+        sl.addStretch()
+
+        # Настройки внизу sidebar
+        settings_btn = self._lunar_side_btn("settings", "Настройки")
+        settings_btn.clicked.connect(self._show_settings)
+        sl.addWidget(settings_btn)
+
+        body.addWidget(side)
+
+        # ── ОСНОВНАЯ ОБЛАСТЬ (большая, с играть-карточкой как у lunar) ──
+        main = QWidget()
+        main.setStyleSheet("background:transparent;")
+        ml = QVBoxLayout(main)
+        ml.setContentsMargins(24, 20, 24, 20)
+        ml.setSpacing(16)
+
+        # ── ОГРОМНАЯ КАРТОЧКА LAUNCH ──
+        launch_card = QFrame()
+        r, g, bb = t["glow_rgb"]
+        launch_card.setStyleSheet(
+            f"QFrame{{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,"
+            f"stop:0 {t['bg_panel']},"
+            f"stop:0.5 {t['bg_panel2']},"
+            f"stop:1 {t['bg_dark']});"
+            f"border:1px solid {t['primary_dark']};"
+            f"border-radius:18px;}}")
+        launch_card.setMinimumHeight(280)
+        lcl = QVBoxLayout(launch_card)
+        lcl.setContentsMargins(40, 36, 40, 36)
+        lcl.setSpacing(12)
+        lcl.addStretch()
+
+        # Большой item-арт по центру
+        big = QLabel()
+        big.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        big.setPixmap(self._item_pix(140))
+        big.setStyleSheet("background:transparent;")
+        lcl.addWidget(big)
+
+        # ОГРОМНАЯ кнопка ИГРАТЬ
+        play_row = QHBoxLayout()
+        play_row.addStretch()
+        self.btn_play = QPushButton(f"ИГРАТЬ  {self.current_version}")
+        self.btn_play.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_play.setMinimumHeight(64)
+        self.btn_play.setMinimumWidth(420)
+        self.btn_play.setIcon(svg_icon("play", 22, "#061006"))
+        self.btn_play.setIconSize(QSize(22, 22))
+        self.btn_play.setStyleSheet(f"""
+            QPushButton {{
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+                    stop:0 {t['primary']},
+                    stop:0.5 {t['accent']},
+                    stop:1 {t['accent_light']});
+                color: #061006;
+                border: none;
+                border-radius: 14px;
+                font: 800 18pt '{F()}';
+                letter-spacing: 2px;
+            }}
+            QPushButton:hover {{
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+                    stop:0 {t['accent']}, stop:1 {t['accent_light']});
+            }}
+            QPushButton:pressed {{
+                background: {t['primary_dark']};
+                color: {t['accent']};
+            }}
+            QPushButton:disabled {{ background:#2a2a2a; color:#666; }}
+        """)
+        self.btn_play.clicked.connect(self._play)
+        play_row.addWidget(self.btn_play)
+        play_row.addStretch()
+        lcl.addLayout(play_row)
+
+        # Под кнопкой — статус
+        self.dl_label = QLabel("Готов к запуску")
+        self.dl_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.dl_label.setStyleSheet(
+            f"color:{t['text_dim']}; font:500 9pt '{F()}';"
+            f"background:transparent; border:none;")
+        lcl.addWidget(self.dl_label)
+
+        self.dl_pct = QLabel("")
+        self.dl_pct.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.dl_pct.setStyleSheet(
+            f"color:{t['accent']}; font:700 9pt '{F()}';"
+            f"background:transparent;")
+        lcl.addWidget(self.dl_pct)
+
+        # Прогресс-бар (узкий)
+        prog_wrap = QHBoxLayout()
+        prog_wrap.addStretch()
+        self.progress = ProgressBar(
+            self.theme, style_name=self.cfg.get("progress_style", "bar"))
+        self.progress.setFixedWidth(420)
+        prog_wrap.addWidget(self.progress)
+        prog_wrap.addStretch()
+        lcl.addLayout(prog_wrap)
+
+        lcl.addStretch()
+        ml.addWidget(launch_card, 1)
+
+        # ── Нижняя строка: ник + кнопка версии ──
+        bottom = QHBoxLayout()
+        bottom.setSpacing(10)
+
+        nick_lbl = QLabel("Никнейм:")
+        nick_lbl.setStyleSheet(
+            f"color:{t['text_dim']}; font:600 9pt '{F()}'; background:transparent;")
+        bottom.addWidget(nick_lbl)
+
+        self.nick = QLineEdit(self.cfg.get("username", "Player"))
+        self.nick.setMaxLength(16)
+        self.nick.setPlaceholderText("Никнейм")
+        self.nick.editingFinished.connect(self._save_nick)
+        self.nick.setStyleSheet(self._inline_input())
+        self.nick.setFixedWidth(220)
+        bottom.addWidget(self.nick)
+
+        bottom.addStretch()
+
+        ver_lbl = QLabel("Версия:")
+        ver_lbl.setStyleSheet(
+            f"color:{t['text_dim']}; font:600 9pt '{F()}'; background:transparent;")
+        bottom.addWidget(ver_lbl)
+
+        self.btn_ver = MD3Button(self.current_version, self.theme, False, "arrow_right", 14)
+        self.btn_ver.clicked.connect(self._pick_version)
+        bottom.addWidget(self.btn_ver)
+
+        ml.addLayout(bottom)
+
+        body.addWidget(main, 1)
+        # Обновим btn_ver текстом профиля если надо
+        QTimer.singleShot(0, self._upd_ver_btn)
+        return wrap
+
+    def _lunar_side_btn(self, icon: str, tooltip: str) -> QPushButton:
+        t = self.theme
+        r, g, b = t["glow_rgb"]
+        btn = QPushButton()
+        btn.setIcon(svg_icon(icon, 22, t["accent"]))
+        btn.setIconSize(QSize(22, 22))
+        btn.setFixedSize(52, 52)
+        btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        btn.setToolTip(tooltip)
+        btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                border: none;
+                border-radius: 10px;
+                margin: 4px 8px;
+            }}
+            QPushButton:hover {{
+                background: rgba({r},{g},{b},0.16);
+            }}
+            QPushButton:pressed {{
+                background: rgba({r},{g},{b},0.28);
+            }}
+        """)
+        return btn
 
     def _title_bar(self) -> QWidget:
         bar = QWidget(); bar.setFixedHeight(48)
@@ -2881,7 +3457,9 @@ class LauncherWindow(QWidget):
         top.addWidget(self.dl_pct)
         outer.addLayout(top)
 
-        self.progress = SnakeProgress(self.theme)
+        self.progress = ProgressBar(
+            self.theme,
+            style_name=self.cfg.get("progress_style", "bar"))
         outer.addWidget(self.progress)
 
         row = QVBoxLayout() if vertical else QHBoxLayout()
@@ -2989,8 +3567,30 @@ class LauncherWindow(QWidget):
             installed = mc.is_version_installed(self.mc_dir, self.current_version)
         except Exception:
             installed = False
-        mark = "  [уст]" if installed else ""
-        self.btn_ver.setText(self.current_version + mark)
+
+        # Текст для btn_ver
+        prof_name = self.cfg.get("last_profile", "")
+        display = self.current_version
+        if prof_name:
+            try:
+                prof = profiles_mod.get_profile(self.mc_dir, prof_name)
+            except Exception:
+                prof = None
+            if prof:
+                ver_id = prof.get("version_id") or prof.get("base", "")
+                if ver_id == self.current_version:
+                    base = prof.get("base", "")
+                    display = f"{prof_name} · {base}"
+
+        if hasattr(self, "btn_ver") and self.btn_ver is not None:
+            mark = "  [уст]" if installed and display == self.current_version else ""
+            self.btn_ver.setText(display + mark)
+
+        # В Lunar-стиле кнопка играть содержит версию — обновляем
+        if hasattr(self, "btn_play") and self.btn_play is not None:
+            cur_text = self.btn_play.text()
+            if cur_text.startswith("ИГРАТЬ"):
+                self.btn_play.setText(f"ИГРАТЬ  {display}")
 
     def _pick_version(self):
         if not self.versions:
@@ -3000,12 +3600,23 @@ class LauncherWindow(QWidget):
             installed = mc.get_installed_versions(self.mc_dir)
         except Exception:
             installed = []
+        try:
+            profs = profiles_mod.list_profiles(self.mc_dir)
+        except Exception:
+            profs = []
         dlg = VersionPickerDialog(
             self.versions, installed,
-            self.current_version, self.theme, self)
+            self.current_version, self.theme,
+            profiles_list=profs, parent=self)
         if dlg.exec():
             self.current_version = dlg.selected
             self.cfg["last_version"] = dlg.selected
+            # Запоминаем выбранный профиль (если выбран)
+            if dlg.selected_profile:
+                self.cfg["last_profile"] = dlg.selected_profile
+            else:
+                # Выбрали vanilla — сбрасываем last_profile
+                self.cfg["last_profile"] = ""
             save_config(self.cfg)
             self._upd_ver_btn()
 
@@ -3122,12 +3733,34 @@ class LauncherWindow(QWidget):
         self._pending_loader = loader
         self.btn_play.setEnabled(False)
         self.btn_play.setText("Загрузка...")
-        self.progress.setIndeterminate(True)
+        self.dl_label.setText(f"Установка {loader}: {version}...")
+
+        # Фейковый плавный прогресс (особенно для fabric, который висит на 5%)
+        # Делаем сильно длиннее, чтобы пользователь видел плавный рост
+        fake_duration = 90.0 if loader == "fabric" else 50.0
+        self._fake_prog = FakeProgressTimer(
+            self.progress, max_pct=92, target_seconds=fake_duration, parent=self)
+        self._fake_prog.start_fake()
+
         self._install_thread = InstallThread(version, self.mc_dir, loader)
-        self._install_thread.progress.connect(self._on_progress)
+        self._install_thread.progress.connect(self._on_install_progress)
         self._install_thread.ok.connect(self._install_ok)
         self._install_thread.failed.connect(self._fail)
         self._install_thread.start()
+
+    def _on_install_progress(self, pct: int, s: str):
+        # Реальный прогресс ТОЛЬКО если он больше текущего fake (не идёт назад)
+        # и больше 30% (Fabric отдаёт только 5% или 100% — оба не годятся для UI)
+        if hasattr(self, "_fake_prog") and self._fake_prog is not None:
+            current_fake = self._fake_prog.current_value()
+            if pct >= max(30, current_fake):
+                self._fake_prog.set_real(pct)
+            # Показываем процент FAKE а не реального — fake плавно растёт
+            shown_pct = self._fake_prog.current_value()
+        else:
+            shown_pct = pct
+        self.dl_pct.setText(f"{shown_pct}%")
+        self.dl_label.setText(s[:80])
 
     def _on_progress(self, pct: int, s: str):
         self.progress.setValue(pct)
@@ -3135,15 +3768,19 @@ class LauncherWindow(QWidget):
         self.dl_label.setText(s[:80])
 
     def _install_ok(self, version: str):
-        self.current_version     = version
-        self.cfg["last_version"] = version
-        save_config(self.cfg)
-        self.btn_play.setEnabled(True)
-        self.btn_play.setText("ИГРАТЬ")
-        self._upd_ver_btn()
+        # Останавливаем фейковый прогресс
+        if hasattr(self, "_fake_prog") and self._fake_prog is not None:
+            try:
+                self._fake_prog.finish()
+            except Exception:
+                pass
+            self._fake_prog = None
 
         pp = self._pending_profile
         self._pending_profile = None
+
+        # Если это была установка ДЛЯ ПРОФИЛЯ — НЕ меняем last_version,
+        # vanilla остаётся доступной как раньше
         if pp:
             try:
                 profiles_mod.create_profile(
@@ -3154,10 +3791,21 @@ class LauncherWindow(QWidget):
                 QMessageBox.information(
                     self, "Профиль",
                     f"Профиль «{pp['name']}» создан.\n"
+                    f"Vanilla {pp['base']} осталась доступна без модов.\n"
                     f"Открой Кастомизацию, чтобы добавить моды.")
             except Exception as ex:
                 QMessageBox.warning(self, "Профиль",
                                     f"Не удалось создать профиль: {ex}")
+            self.btn_play.setEnabled(True)
+            self.btn_play.setText("ИГРАТЬ")
+            self._upd_ver_btn()
+        else:
+            self.current_version     = version
+            self.cfg["last_version"] = version
+            save_config(self.cfg)
+            self.btn_play.setEnabled(True)
+            self.btn_play.setText("ИГРАТЬ")
+            self._upd_ver_btn()
 
         loader = self._pending_loader or "vanilla"
         self._pending_loader = None
@@ -3172,13 +3820,32 @@ class LauncherWindow(QWidget):
             offered.append(base_ver)
             self.cfg["sodium_offered_versions"] = offered
             save_config(self.cfg)
-            QTimer.singleShot(400, lambda: self._offer_sodium(base_ver))
+            # Если установка под профиль — кладём sodium в его mods/
+            target_mods = None
+            if pp:
+                try:
+                    target_mods = profiles_mod.mods_dir(
+                        self.mc_dir, pp["name"])
+                except Exception:
+                    target_mods = None
+            QTimer.singleShot(
+                400, lambda: self._offer_sodium(base_ver, target_mods))
         else:
             QTimer.singleShot(350, lambda: self._launch(version))
 
-    def _offer_sodium(self, base_ver: str):
+    def _offer_sodium(self, base_ver: str, mods_dir: Path = None):
+        # Если есть профиль — кладём sodium в его mods/, иначе в global mods/
+        if mods_dir is None:
+            last_p = self.cfg.get("last_profile", "")
+            if last_p:
+                try:
+                    mods_dir = profiles_mod.mods_dir(self.mc_dir, last_p)
+                except Exception:
+                    mods_dir = self.mc_dir / "mods"
+            else:
+                mods_dir = self.mc_dir / "mods"
         dlg = SodiumOfferDialog(
-            self.theme, base_ver, self.mc_dir, is_fabric=True, parent=self)
+            self.theme, base_ver, mods_dir, is_fabric=True, parent=self)
         dlg.exec()
         QTimer.singleShot(200, lambda: self._launch(self.current_version))
 
@@ -3281,47 +3948,75 @@ class LauncherWindow(QWidget):
 
     def _launch(self, version: str):
         need_java = self._required_java(version)
+        base_ver = self._base_mc_version(version)
+
+        # 1. ПРИОРИТЕТ: ранее одобренный override для этой версии
+        overrides = self.cfg.get("java_overrides", {}) or {}
+        saved_java = overrides.get(base_ver) or overrides.get(version)
+        if saved_java and Path(saved_java).exists():
+            java = saved_java
+            current_major = self._java_major(java)
+            self._do_launch(version, java)
+            return
+
+        # 2. Указанный в настройках Java
         user_path = self.cfg.get("java_path", "").strip()
         try:
             java = mc.find_java(user_path) if user_path else mc.find_java()
         except Exception:
             java = None
-
         current_major = self._java_major(java) if java else None
 
-        if current_major != need_java:
+        # 3. Если несовпадение — пробуем найти подходящую
+        if current_major is None or current_major < need_java:
             better = self._find_compatible_java(need_java)
             if better:
                 java = better
                 current_major = need_java
 
+        # 4. Если до сих пор Java нет — ошибка
         if not java:
             QMessageBox.warning(
                 self, "Java",
                 f"Java не найдена.\n"
-                f"Для MC {self._base_mc_version(version)} нужна Java {need_java}.\n"
+                f"Для MC {base_ver} нужна Java {need_java}.\n"
                 f"Укажите путь в настройках.")
             self.btn_play.setEnabled(True)
             self.btn_play.setText("ИГРАТЬ")
             return
 
-        if current_major and current_major != need_java:
-            base = self._base_mc_version(version)
-            res = QMessageBox.question(
-                self, "Java несовместима",
-                f"Для Minecraft {base} нужна Java {need_java}, "
-                f"а найдена Java {current_major}.\n\n"
-                f"Установи Java {need_java}:\n"
-                f"  Java 8:  adoptium.net/temurin/releases?version=8\n"
-                f"  Java 17: adoptium.net/temurin/releases?version=17\n"
-                f"  Java 21: adoptium.net/temurin/releases?version=21\n\n"
-                f"Попробовать запустить всё равно?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No)
-            if res != QMessageBox.StandardButton.Yes:
-                self.btn_play.setEnabled(True)
-                self.btn_play.setText("ИГРАТЬ")
-                return
+        # 5. ПРАВИЛО: если Java БОЛЬШЕ или РАВНА требуемой — не спрашиваем
+        if current_major is not None and current_major >= need_java:
+            self._do_launch(version, java)
+            return
+
+        # 6. Java меньше требуемой — спрашиваем (один раз, потом запоминаем)
+        res = QMessageBox.question(
+            self, "Java несовместима",
+            f"Для Minecraft {base_ver} нужна Java {need_java}, "
+            f"а найдена Java {current_major}.\n\n"
+            f"Установи Java {need_java}:\n"
+            f"  Java 8:  adoptium.net/temurin/releases?version=8\n"
+            f"  Java 17: adoptium.net/temurin/releases?version=17\n"
+            f"  Java 21: adoptium.net/temurin/releases?version=21\n\n"
+            f"Если нажмёшь «Да» — больше не спросим для этой версии.\n"
+            f"Запустить?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if res != QMessageBox.StandardButton.Yes:
+            self.btn_play.setEnabled(True)
+            self.btn_play.setText("ИГРАТЬ")
+            return
+
+        # Запоминаем согласие: для этой версии запускаем с этой Java без вопросов
+        overrides[base_ver] = java
+        self.cfg["java_overrides"] = overrides
+        save_config(self.cfg)
+
+        self._do_launch(version, java)
+
+    def _do_launch(self, version: str, java: str):
+        """Финальный запуск (без диалогов)."""
 
         self.dl_label.setText(f"Запуск {version}...")
         self.progress.setValue(100)
@@ -3344,6 +4039,12 @@ class LauncherWindow(QWidget):
         ))
 
     def _fail(self, err: str):
+        if hasattr(self, "_fake_prog") and self._fake_prog is not None:
+            try:
+                self._fake_prog.stop()
+            except Exception:
+                pass
+            self._fake_prog = None
         self.btn_play.setEnabled(True)
         self.btn_play.setText("ИГРАТЬ")
         self.progress.setValue(0)
@@ -3353,6 +4054,9 @@ class LauncherWindow(QWidget):
     def _show_settings(self):
         old_snap = self.cfg.get("show_snapshots")
         dlg = SettingsDialog(self.cfg, self.theme, self.online, self)
+        # Прогоняем event loop чтобы все иконки секций успели прорисоваться
+        for _ in range(3):
+            QApplication.processEvents()
         if dlg.exec():
             self.cfg.update(dlg.result_cfg)
             save_config(self.cfg)
@@ -3361,8 +4065,15 @@ class LauncherWindow(QWidget):
             self.resize(int(self.cfg["window_width"]),
                         int(self.cfg["window_height"]))
             self._apply_icon()
+            # Обновить стиль главного прогресс-бара
+            if hasattr(self, "progress") and hasattr(self.progress, "setStyleName"):
+                self.progress.setStyleName(
+                    self.cfg.get("progress_style", "bar"))
             if hasattr(self, "_overlay"):
                 self._overlay.apply_theme(self.theme)
+                # Применяем новую ширину обводки
+                new_b = int(self.cfg.get("border_width", self.BORDER))
+                self._overlay.set_border(new_b)
             if self.theme.get("rainbow"):
                 if not self._rb_timer.isActive():
                     self._rb_timer.start(28)
@@ -3386,29 +4097,213 @@ class LauncherWindow(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════
+#  SplashScreen — заставка при запуске лаунчера
+# ═══════════════════════════════════════════════════════════════
+
+class SplashScreen(QWidget):
+    """Безрамочная заставка с крутящимся item (easy-out)."""
+
+    def __init__(self, theme: dict, item_pixmap: QPixmap, parent=None):
+        super().__init__(parent)
+        self.theme = theme
+        self.item_pix = item_pixmap
+        self._angle = 0.0
+
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFixedSize(360, 360)
+
+        try:
+            scr = QApplication.primaryScreen().geometry()
+            self.move((scr.width() - self.width()) // 2,
+                      (scr.height() - self.height()) // 2)
+        except Exception:
+            pass
+
+        import time as _t
+        self._t_mod = _t
+        self._start_ms = _t.time() * 1000
+        self._tm = QTimer(self)
+        self._tm.timeout.connect(self._tick)
+        self._tm.start(16)
+
+    def _tick(self):
+        elapsed = (self._t_mod.time() * 1000 - self._start_ms) / 1000.0
+        if elapsed < 1.4:
+            t = elapsed / 1.4
+            ease = 1 - (1 - t) ** 3
+            self._angle = ease * 540
+        else:
+            self._angle = 540 + (elapsed - 1.4) * 60
+        self.update()
+
+    def paintEvent(self, _e):
+        from PyQt6.QtGui import QTransform, QRadialGradient
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+
+        cx = self.width() // 2
+        cy = self.height() // 2
+        radius = 130
+
+        glow = QRadialGradient(cx, cy, radius + 40)
+        r, g, b = self.theme["glow_rgb"]
+        glow.setColorAt(0.0, QColor(r, g, b, 110))
+        glow.setColorAt(0.6, QColor(r, g, b, 30))
+        glow.setColorAt(1.0, QColor(0, 0, 0, 0))
+        p.setBrush(QBrush(glow))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(QRectF(cx - radius - 40, cy - radius - 40,
+                              (radius + 40) * 2, (radius + 40) * 2))
+
+        if not self.item_pix.isNull():
+            tr = QTransform()
+            tr.translate(cx, cy)
+            tr.rotate(self._angle)
+            tr.translate(-self.item_pix.width() / 2,
+                         -self.item_pix.height() / 2)
+            p.setTransform(tr)
+            p.drawPixmap(0, 0, self.item_pix)
+            p.resetTransform()
+
+        p.setPen(QColor(self.theme["accent"]))
+        f = QFont(F(), 14, QFont.Weight.Bold)
+        p.setFont(f)
+        text_rect = QRectF(0, cy + radius + 10, self.width(), 30)
+        p.drawText(text_rect, int(Qt.AlignmentFlag.AlignCenter), "Exelent Launcher")
+
+        f2 = QFont(F(), 9)
+        p.setFont(f2)
+        p.setPen(QColor(self.theme["text_dim"]))
+        text_rect2 = QRectF(0, cy + radius + 38, self.width(), 20)
+        p.drawText(text_rect2, int(Qt.AlignmentFlag.AlignCenter), "загрузка...")
+
+        p.end()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  FakeProgressTimer — медленная имитация загрузки 0 -> max_pct
+# ═══════════════════════════════════════════════════════════════
+
+class FakeProgressTimer(QTimer):
+    """
+    Имитирует плавную загрузку. Полезно для Fabric, который реальный
+    прогресс почти не отдаёт (висит на 5% и резко 100%).
+    """
+
+    def __init__(self, progress_widget, max_pct: int = 88,
+                 target_seconds: float = 60.0, parent=None):
+        super().__init__(parent)
+        self.pw = progress_widget
+        self.max_pct = max_pct
+        self.duration = target_seconds
+        self._t0 = None
+        self._real_pct = None
+        self._cur_val = 0
+        self.timeout.connect(self._tick)
+
+    def current_value(self) -> int:
+        return self._cur_val
+
+    def start_fake(self):
+        import time as _t
+        self._t0 = _t.time()
+        self._real_pct = None
+        self._cur_val = 0
+        try:
+            self.pw.setValue(0)
+        except Exception:
+            pass
+        self.start(60)  # 60ms тик — более плавно
+
+    def set_real(self, pct: int):
+        new = max(0, min(100, int(pct)))
+        # Никогда не идём назад
+        if new < self._cur_val:
+            return
+        self._real_pct = new
+        self._cur_val = new
+        try:
+            self.pw.setValue(new)
+        except Exception:
+            pass
+
+    def finish(self):
+        self._cur_val = 100
+        try:
+            self.pw.setValue(100)
+        except Exception:
+            pass
+        self.stop()
+
+    def _tick(self):
+        # Если был set_real — продолжаем плавно от него к max_pct
+        import time as _t
+        if self._t0 is None:
+            return
+        elapsed = _t.time() - self._t0
+        t = min(1.0, elapsed / self.duration)
+        # Easy-out квадратичный — медленнее в конце
+        ease = 1 - (1 - t) ** 2
+        fake_val = int(ease * self.max_pct)
+        # Берём максимум из fake и реального — не идём назад
+        target = max(fake_val, self._cur_val)
+        if self._real_pct is not None:
+            target = max(target, self._real_pct)
+        if target != self._cur_val:
+            self._cur_val = target
+            try:
+                self.pw.setValue(target)
+            except Exception:
+                pass
+
+
+# ═══════════════════════════════════════════════════════════════
 #  Entry point
 # ═══════════════════════════════════════════════════════════════
 
 def main():
     set_windows_app_id()
 
-    # QApplication ВСЕГДА создаётся первым
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle("Fusion")
     load_custom_font()
     app.setFont(get_font(10))
 
-    # ensure_builtin_assets создаёт QPixmap — только после QApplication
     try:
         themes_mod.ensure_builtin_assets()
     except Exception:
         pass
 
+    # ── Splash с крутящимся item ──
+    cfg = load_config()
+    theme = themes_mod.get_theme(
+        cfg.get("theme", "emerald"), cfg.get("custom_colors", {}))
+    try:
+        item_pix = themes_mod.get_item_pixmap(
+            cfg.get("item", "emerald"), 160)
+    except Exception:
+        item_pix = QPixmap()
+
+    splash = SplashScreen(theme, item_pix)
+    splash.show()
+    app.processEvents()
+
     w = LauncherWindow()
-    w.show()
+
+    # Минимум 1.2 сек показываем splash чтобы анимация была видна
+    def _show_main():
+        w.show()
+        splash.close()
+
+    QTimer.singleShot(1200, _show_main)
 
     if os.environ.get("EXELENT_SCREENSHOT") == "1":
-        QTimer.singleShot(1400, lambda: (
+        QTimer.singleShot(2600, lambda: (
             w.grab().save(str(APP_DIR / "screenshot.png")),
             print("Saved screenshot.png"),
         ))
