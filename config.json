@@ -28,8 +28,7 @@
   "border_width": 6,
   "java_overrides": {},
   "config_version": 2,
-  "launcher_version": "1.31",
+  "launcher_version": "1.2",
   "server_address": "",
-  "show_server_card": true,
-  "optimizedstart": true
+  "show_server_card": true
 }

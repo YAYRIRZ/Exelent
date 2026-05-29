@@ -127,36 +127,59 @@ def get_font(size: int = 10, bold: bool = False) -> QFont:
 
 
 def desktop_path() -> Path:
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            import ctypes.wintypes
-            buf = ctypes.create_unicode_buffer(ctypes.wintypes.MAX_PATH)
-            ctypes.windll.shell32.SHGetFolderPathW(None, 0x10, None, 0, buf)
-            return Path(buf.value)
-        except Exception:
-            return Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Desktop"
-    return Path.home() / "Desktop"
+    """Путь к рабочему столу Windows."""
+    try:
+        import ctypes
+        import ctypes.wintypes
+        buf = ctypes.create_unicode_buffer(ctypes.wintypes.MAX_PATH)
+        ctypes.windll.shell32.SHGetFolderPathW(None, 0x10, None, 0, buf)
+        return Path(buf.value)
+    except Exception:
+        return Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Desktop"
+
+
+def _installed_info_file() -> Path:
+    """%USERPROFILE%/exelent/installed_info.txt"""
+    base = Path(os.environ.get(
+        "USERPROFILE", os.path.expanduser("~"))) / "exelent"
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return base / "installed_info.txt"
 
 
 def save_installed_info(install_dir: Path) -> None:
-    """Записывает путь install_dir в %USERPROFILE%/exelent/installed_info.txt.
-    На Linux/Mac: ~/.exelent/installed_info.txt.
+    """Записывает путь install_dir в installed_info.txt.
 
-    main.py при следующем запуске прочитает этот файл и сразу запустит
-    лаунчер из install_dir, не показывая инсталлер повторно.
+    Этот путь используется инсталлером ПРИ СЛЕДУЮЩЕМ запуске как
+    дефолтный (для обновления), чтобы пользователь не выбирал папку
+    повторно.
     """
-    if sys.platform == "win32":
-        base = Path(os.environ.get(
-            "USERPROFILE", os.path.expanduser("~"))) / "exelent"
-    else:
-        base = Path(os.path.expanduser("~")) / ".exelent"
     try:
-        base.mkdir(parents=True, exist_ok=True)
-        (base / "installed_info.txt").write_text(
+        _installed_info_file().write_text(
             str(Path(install_dir).resolve()), encoding="utf-8")
     except Exception:
         pass
+
+
+def read_installed_info() -> Path | None:
+    """Читает путь из installed_info.txt.
+    Возвращает Path или None, если файла нет / путь невалиден.
+    """
+    f = _installed_info_file()
+    if not f.exists():
+        return None
+    try:
+        raw = f.read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+    if not raw:
+        return None
+    p = Path(raw)
+    # ВАЖНО: не проверяем p.exists() — может быть пустой папка стёрта,
+    # но юзер хочет установить туда же.
+    return p
 
 
 def create_shortcut_windows(exe_path: Path, install_dir: Path,
@@ -184,27 +207,11 @@ def create_shortcut_windows(exe_path: Path, install_dir: Path,
     result = subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
         capture_output=True, text=True,
-        creationflags=0x08000000 if sys.platform == "win32" else 0,
+        creationflags=0x08000000,  # CREATE_NO_WINDOW
     )
     if result.returncode == 0 and link.exists():
         return f"Ярлык создан:\n{link}"
     return f"Ярлык не создан: {(result.stderr or '').strip()[:160]}"
-
-
-def create_shortcut_linux(exe_path: Path, icon_path: Path | None = None) -> str:
-    desk = desktop_path()
-    desk.mkdir(parents=True, exist_ok=True)
-    entry = desk / "Exelent Launcher.desktop"
-    icon_line = f"Icon={icon_path}" if icon_path and icon_path.exists() else ""
-    entry.write_text(
-        f"[Desktop Entry]\nType=Application\nName=Exelent Launcher\n"
-        f"Exec={exe_path}\n{icon_line}\nTerminal=false\nCategories=Game;\n",
-        encoding="utf-8")
-    try:
-        entry.chmod(0o755)
-    except Exception:
-        pass
-    return f"Ярлык создан:\n{entry}"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -541,10 +548,7 @@ class InstallThread(QThread):
                     break
 
             try:
-                if sys.platform == "win32":
-                    shortcut_msg = create_shortcut_windows(exe_dst, dst, icon_path)
-                else:
-                    shortcut_msg = create_shortcut_linux(exe_dst, icon_path)
+                shortcut_msg = create_shortcut_windows(exe_dst, dst, icon_path)
             except Exception as ex:
                 shortcut_msg = f"Ярлык не создан: {ex}"
 
@@ -662,14 +666,23 @@ class Installer(QWidget):
     def __init__(self):
         super().__init__()
         self.theme       = themes_mod.get_theme("emerald")
-        self.install_dir = Path.home() / "ExelentLauncher"
+        # Если уже устанавливали — подставим сохранённый путь
+        # (так пользователь при обновлении не будет вводить его заново).
+        try:
+            saved_dir = read_installed_info()
+        except Exception:
+            saved_dir = None
+        self.install_dir = saved_dir or (Path.home() / "ExelentLauncher")
+        self._is_update = saved_dir is not None
         self._drag_pos   = None
         self._thread: InstallThread | None = None
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setWindowTitle("Exelent Launcher — Установка")
+        self.setWindowTitle(
+            "Exelent Launcher — Обновление" if self._is_update
+            else "Exelent Launcher — Установка")
         self.setFixedSize(640, 540)
 
         ico = themes_mod.get_item_path("emerald")
@@ -895,7 +908,9 @@ class Installer(QWidget):
         btn_row = QHBoxLayout()
         btn_row.setSpacing(10)
 
-        self.btn_install = GradientButton("  Установить", t, "download")
+        self.btn_install = GradientButton(
+            "  Обновить" if self._is_update else "  Установить",
+            t, "download")
         self.btn_install.setEnabled(src_ok)
         self.btn_install.clicked.connect(self._start_install)
 
@@ -980,11 +995,12 @@ class Installer(QWidget):
             self.close()
             return
         try:
-            kw: dict = {}
-            if sys.platform == "win32":
-                kw["creationflags"] = 0x00000008 | 0x00000200
-            subprocess.Popen([str(exe)], cwd=str(install_dir),
-                             close_fds=True, **kw)
+            # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP — отвязать от
+            # текущего процесса инсталлера, чтобы лаунчер пережил его смерть.
+            subprocess.Popen(
+                [str(exe)], cwd=str(install_dir),
+                close_fds=True,
+                creationflags=0x00000008 | 0x00000200)
         except Exception as ex:
             QMessageBox.warning(self, "Запуск", f"Не удалось запустить:\n{ex}")
         finally:

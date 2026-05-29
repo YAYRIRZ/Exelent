@@ -221,12 +221,7 @@ def open_folder(path: Path) -> None:
     except Exception:
         pass
     try:
-        if sys.platform == "win32":
-            os.startfile(str(path))
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", str(path)])
-        else:
-            subprocess.Popen(["xdg-open", str(path)])
+        os.startfile(str(path))
     except Exception:
         pass
 
@@ -234,15 +229,12 @@ def open_folder(path: Path) -> None:
 def installed_info_path() -> Path:
     """Путь к файлу с записью места установки лаунчера.
 
-    Хранится в %USERPROFILE%/exelent/installed_info.txt (Windows) или
-    ~/.exelent/installed_info.txt (Linux/Mac). Используется main.py чтобы
-    понять, есть ли установленная копия и не запускать инсталлер заново.
+    Хранится в %USERPROFILE%/exelent/installed_info.txt. Используется
+    main.py чтобы понять, есть ли установленная копия и не запускать
+    инсталлер заново.
     """
-    if sys.platform == "win32":
-        base = Path(os.environ.get("USERPROFILE",
-                                    os.path.expanduser("~"))) / "exelent"
-    else:
-        base = Path(os.path.expanduser("~")) / ".exelent"
+    base = Path(os.environ.get("USERPROFILE",
+                                os.path.expanduser("~"))) / "exelent"
     try:
         base.mkdir(parents=True, exist_ok=True)
     except Exception:
@@ -280,12 +272,11 @@ def read_installed_info() -> Path | None:
 
 
 def set_windows_app_id() -> None:
-    if sys.platform == "win32":
-        try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "Exelent.Launcher.v3")
-        except Exception:
-            pass
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "Exelent.Launcher.v3")
+    except Exception:
+        pass
 
 
 def has_internet(timeout: float = 3.0) -> bool:
@@ -2667,23 +2658,82 @@ class SodiumOfferDialog(ThemedDialog):
 #  OutdatedDialog
 # ═══════════════════════════════════════════════════════════════
 
+def _write_update_bat(src: Path, dst: Path, pid: int) -> Path:
+    """Создаёт .bat-апдейтер (Windows only), который:
+      1. Ждёт, пока процесс с PID завершится.
+      2. Копирует ВСЁ из src поверх dst (robocopy /E).
+      3. Запускает Exelent Launcher.exe.
+      4. Самоудаляется.
+
+    Возвращает путь к .bat.
+    """
+    import tempfile
+    src = Path(src).resolve()
+    dst = Path(dst).resolve()
+    tmp_dir = Path(tempfile.gettempdir())
+
+    bat = tmp_dir / f"exelent_update_{pid}.bat"
+    # robocopy:
+    #   /E   — включая подпапки (и пустые)
+    #   /IS  — копировать «одинаковые» файлы тоже (на случай кэша прав)
+    #   /R:5 /W:1 — 5 ретраев по 1 сек на залоченных файлах
+    #   /XJ  — пропускать junction points
+    content = (
+        "@echo off\r\n"
+        "chcp 65001 >nul\r\n"
+        f"echo Exelent Updater - waiting for launcher to close (PID {pid})...\r\n"
+        ":waitloop\r\n"
+        f"tasklist /FI \"PID eq {pid}\" 2>nul | find \"{pid}\" >nul\r\n"
+        "if not errorlevel 1 (\r\n"
+        "    timeout /t 1 /nobreak >nul\r\n"
+        "    goto waitloop\r\n"
+        ")\r\n"
+        "echo Copying files...\r\n"
+        "timeout /t 1 /nobreak >nul\r\n"
+        f"robocopy \"{src}\" \"{dst}\" /E /IS /R:5 /W:1 /XJ >nul\r\n"
+        "if errorlevel 8 (\r\n"
+        "    echo Copy failed. Source folder:\r\n"
+        f"    echo {src}\r\n"
+        "    pause\r\n"
+        "    exit /b 1\r\n"
+        ")\r\n"
+        "echo Launching new version...\r\n"
+        "timeout /t 1 /nobreak >nul\r\n"
+        f"start \"\" \"{dst}\\Exelent Launcher.exe\"\r\n"
+        f"rmdir /S /Q \"{src}\" >nul 2>&1\r\n"
+        "(goto) 2>nul & del \"%~f0\"\r\n"
+    )
+    bat.write_text(content, encoding="utf-8")
+    return bat
+
+
 class _UpdateDownloadThread(QThread):
-    """Качает Exelent.Launcher.zip с GitHub Releases и распаковывает."""
+    """Качает Exelent.Launcher.zip с GitHub Releases и распаковывает
+    во ВРЕМЕННУЮ папку (не в APP_DIR!).
+
+    Почему не сразу в APP_DIR:
+      • На Windows запущенный .exe ЗАЛОЧЕН ОС → перезапись падает
+        с PermissionError [Errno 13].
+      • Поэтому распакуем во временную папку %TEMP%/exelent_update_<ver>,
+        а копирование поверх APP_DIR сделает внешний .bat,
+        который запустится ПОСЛЕ закрытия лаунчера.
+    """
     progress = pyqtSignal(int, str)   # 0..100, status
     done     = pyqtSignal(str)        # path to extracted folder
     failed   = pyqtSignal(str)
 
-    def __init__(self, version: str, target_dir: Path, parent=None):
+    def __init__(self, version: str, parent=None):
         super().__init__(parent)
-        self._ver        = version
-        self._target_dir = Path(target_dir)
+        self._ver = version
 
     def run(self):
         try:
+            import tempfile
+
             url = RELEASE_ZIP_URL.format(ver=self._ver)
             self.progress.emit(2, f"Скачивание Exelent {self._ver}...")
             req = urllib.request.Request(
-                url, headers={"User-Agent": "ExelentLauncher-Updater/1.0"})
+                url, headers={"User-Agent": f"ExelentLauncher-Updater/{APP_VERSION}"})
             with urllib.request.urlopen(req, timeout=60) as r:
                 try:
                     total = int(r.headers.get("Content-Length") or 0)
@@ -2707,14 +2757,37 @@ class _UpdateDownloadThread(QThread):
                             50, f"Скачано {done // 1024} КБ")
             data = b"".join(chunks)
 
-            # Распаковываем рядом с target_dir во временную папку,
-            # затем подмена / merge — это безопаснее.
-            self.progress.emit(90, "Распаковка...")
-            self._target_dir.mkdir(parents=True, exist_ok=True)
+            # ── Распаковка в TEMP ──
+            self.progress.emit(90, "Распаковка во временную папку...")
+            tmp_root = Path(tempfile.gettempdir()) / f"exelent_update_{self._ver}"
+            # Чистим если осталось от прошлой попытки
+            try:
+                if tmp_root.exists():
+                    shutil.rmtree(tmp_root, ignore_errors=True)
+            except Exception:
+                pass
+            tmp_root.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(io.BytesIO(data)) as zf:
-                zf.extractall(str(self._target_dir))
+                zf.extractall(str(tmp_root))
+
+            # В архиве может быть либо файлы в корне, либо одна
+            # папка-обёртка (например Exelent.Launcher/_internal/...).
+            # Найдём «настоящий» корень — там должен быть Exelent Launcher.exe
+            # ИЛИ папка _internal.
+            real_root = tmp_root
+            try:
+                entries = [p for p in tmp_root.iterdir()]
+                exe_here = any(p.name.lower() == "exelent launcher.exe"
+                               for p in entries)
+                int_here = any(p.is_dir() and p.name == "_internal"
+                               for p in entries)
+                if not (exe_here or int_here) and len(entries) == 1 and entries[0].is_dir():
+                    real_root = entries[0]
+            except Exception:
+                pass
+
             self.progress.emit(100, "Готово")
-            self.done.emit(str(self._target_dir))
+            self.done.emit(str(real_root))
         except Exception as ex:
             self.failed.emit(str(ex))
 
@@ -2770,8 +2843,6 @@ class OutdatedDialog(ThemedDialog):
         if not self._remote:
             QMessageBox.warning(self, "Обновление", "Не удалось определить версию.")
             return
-        # Куда распаковывать? В папку, где сейчас лежит лаунчер.
-        target = APP_DIR
         self._prog_label.show()
         self._prog.show()
         self._prog.setValue(0)
@@ -2779,7 +2850,7 @@ class OutdatedDialog(ThemedDialog):
         self._dl_btn.setEnabled(False)
         self._dl_btn.setText("Скачивание...")
 
-        self._dl_thread = _UpdateDownloadThread(self._remote, target, self)
+        self._dl_thread = _UpdateDownloadThread(self._remote, self)
         self._dl_thread.progress.connect(self._on_prog)
         self._dl_thread.done.connect(self._on_done)
         self._dl_thread.failed.connect(self._on_fail)
@@ -2789,30 +2860,61 @@ class OutdatedDialog(ThemedDialog):
         self._prog.setValue(pct)
         self._prog_label.setText(f"{pct}% — {st[:80]}")
 
-    def _on_done(self, where: str):
+    def _on_done(self, source_dir: str):
+        """Обновление скачано в TEMP — теперь запустим .bat, который
+        дождётся закрытия лаунчера и скопирует файлы поверх APP_DIR."""
         self._prog.setValue(100)
         self._prog_label.setText("Готово! Перезапуск...")
-        # Обновим installed_info.txt
         try:
             save_installed_info(APP_DIR)
         except Exception:
             pass
+
+        src = Path(source_dir)
+        dst = APP_DIR
+
+        # Создаём .bat-апдейтер
+        try:
+            bat_path = _write_update_bat(src, dst, os.getpid())
+        except Exception as ex:
+            QMessageBox.critical(
+                self, "Обновление",
+                f"Не удалось создать апдейтер:\n{ex}\n\n"
+                f"Файлы обновления лежат в:\n{src}\n\n"
+                f"Можно скопировать вручную поверх:\n{dst}")
+            return
+
         QMessageBox.information(
             self, "Обновление",
-            f"Обновление установлено в:\n{where}\n\n"
-            f"Лаунчер сейчас перезапустится.")
-        # Перезапуск
+            f"Лаунчер сейчас закроется. Апдейтер заменит файлы и "
+            f"запустит новую версию автоматически.\n\n"
+            f"Источник:\n{src}\n→\n{dst}")
+
+        # Запускаем .bat в отдельном окне.
+        # ВАЖНО: DETACHED_PROCESS (0x8) и CREATE_NEW_CONSOLE (0x10) —
+        # взаимоисключающие флаги! Передача их вместе даёт WinError 87
+        # «Параметр задан неверно». Используем ТОЛЬКО CREATE_NEW_CONSOLE,
+        # чтобы у .bat было своё окно и он жил после смерти лаунчера.
         try:
-            exe_path = APP_DIR / "Exelent Launcher.exe"
-            if exe_path.exists():
-                subprocess.Popen([str(exe_path)], cwd=str(APP_DIR),
-                                 close_fds=True)
-            else:
-                # fallback — текущий процесс
-                subprocess.Popen([sys.executable] + sys.argv,
-                                 cwd=str(APP_DIR), close_fds=True)
-        except Exception:
-            pass
+            # Windows-only. Один флаг CREATE_NEW_CONSOLE — апдейтер получит
+            # своё окно. CREATE_BREAKAWAY_FROM_JOB критичен для PyInstaller-
+            # билда: иначе дочерний cmd умрёт вместе с лаунчером.
+            CREATE_NEW_CONSOLE = 0x00000010
+            CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+            subprocess.Popen(
+                f'cmd.exe /c ""{bat_path}""',
+                cwd=str(dst),
+                creationflags=CREATE_NEW_CONSOLE | CREATE_BREAKAWAY_FROM_JOB,
+                close_fds=True,
+                shell=False)
+        except Exception as ex:
+            QMessageBox.critical(
+                self, "Обновление",
+                f"Не удалось запустить апдейтер:\n{ex}\n\n"
+                f"Запусти вручную:\n{bat_path}")
+            return
+
+        # Выход из текущего процесса (быстро, чтобы .bat смог копировать)
         QApplication.quit()
 
     def _on_fail(self, err: str):
@@ -4375,29 +4477,25 @@ class LauncherWindow(QWidget):
 
     @staticmethod
     def _system_ram() -> int:
-        """Total RAM in MB."""
+        """Total RAM in MB (Windows via GlobalMemoryStatusEx)."""
         try:
-            import os as _os
-            if sys.platform == "win32":
-                try:
-                    import ctypes.wintypes as _w
-                    class MEMORYSTATUSEX(_w.Structure):
-                        _fields_ = [("dwLength",_w.DWORD),("dwMemoryLoad",_w.DWORD),
-                            ("ullTotalPhys",ctypes.c_ulonglong),("ullAvailPhys",ctypes.c_ulonglong),
-                            ("ullTotalPageFile",ctypes.c_ulonglong),("ullAvailPageFile",ctypes.c_ulonglong),
-                            ("ullTotalVirtual",ctypes.c_ulonglong),("ullAvailVirtual",ctypes.c_ulonglong),
-                            ("ullAvailExtendedVirtual",ctypes.c_ulonglong)]
-                    ms = MEMORYSTATUSEX()
-                    ms.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-                    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
-                    return int(ms.ullTotalPhys // (1024*1024))
-                except Exception:
-                    pass
-            else:
-                with open("/proc/meminfo") as f:
-                    for line in f:
-                        if "MemTotal" in line:
-                            return int(line.split()[1]) // 1024
+            import ctypes.wintypes as _w
+            class MEMORYSTATUSEX(_w.Structure):
+                _fields_ = [
+                    ("dwLength", _w.DWORD),
+                    ("dwMemoryLoad", _w.DWORD),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            ms = MEMORYSTATUSEX()
+            ms.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
+            return int(ms.ullTotalPhys // (1024 * 1024))
         except Exception:
             pass
         return 2048  # fallback 2 GB
@@ -4483,11 +4581,10 @@ class LauncherWindow(QWidget):
         if not java_path:
             return None
         try:
-            kw = {}
-            if sys.platform == "win32":
-                kw["creationflags"] = 0x08000000
-            r = subprocess.run([java_path, "-version"],
-                               capture_output=True, text=True, timeout=4, **kw)
+            r = subprocess.run(
+                [java_path, "-version"],
+                capture_output=True, text=True, timeout=4,
+                creationflags=0x08000000)  # CREATE_NO_WINDOW
             out = (r.stderr or "") + (r.stdout or "")
             import re as _re
             m = _re.search(r'version\s+"([^"]+)"', out)
@@ -4514,33 +4611,22 @@ class LauncherWindow(QWidget):
             return auto
 
         candidates = []
-        if sys.platform == "win32":
-            roots = [
-                Path("C:/Program Files/Java"),
-                Path("C:/Program Files (x86)/Java"),
-                Path("C:/Program Files/Eclipse Adoptium"),
-                Path("C:/Program Files/Microsoft"),
-                Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Eclipse Adoptium",
-            ]
-            for root in roots:
-                try:
-                    if root.exists() and root.is_dir():
-                        for j in root.rglob("javaw.exe"):
-                            candidates.append(j)
-                        for j in root.rglob("java.exe"):
-                            candidates.append(j)
-                except Exception:
-                    continue
-        else:
-            for base in ("/usr/lib/jvm", "/Library/Java/JavaVirtualMachines"):
-                p = Path(base)
-                if p.exists():
-                    try:
-                        for j in p.rglob("java"):
-                            if j.is_file() and os.access(j, os.X_OK):
-                                candidates.append(j)
-                    except Exception:
-                        continue
+        roots = [
+            Path("C:/Program Files/Java"),
+            Path("C:/Program Files (x86)/Java"),
+            Path("C:/Program Files/Eclipse Adoptium"),
+            Path("C:/Program Files/Microsoft"),
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Eclipse Adoptium",
+        ]
+        for root in roots:
+            try:
+                if root.exists() and root.is_dir():
+                    for j in root.rglob("javaw.exe"):
+                        candidates.append(j)
+                    for j in root.rglob("java.exe"):
+                        candidates.append(j)
+            except Exception:
+                continue
 
         for c in candidates:
             if self._java_major(str(c)) == want_major:
