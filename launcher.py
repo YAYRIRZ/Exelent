@@ -49,8 +49,8 @@ CONFIG_FILE = APP_DIR / "config.json"
 FONTS_DIR   = APP_DIR / "fonts"
 BLOCKS_DIR  = APP_DIR / "assets" / "blocks"
 
-APP_VERSION       = "1.3"
-CONFIG_VERSION    = 3     # Версия структуры config.json (для миграций)
+APP_VERSION       = "1.31"
+CONFIG_VERSION    = 2     # Версия структуры config.json (для миграций)
 VERSION_CHECK_URL = ("https://raw.githubusercontent.com/"
                     "YAYRIRZ/SkyPluginsVersion/refs/heads/main/ExelentLauncher")
 TELEGRAM_CONTACT  = "t.me/YAYRIRZ"
@@ -1006,6 +1006,27 @@ class ModrinthDownloadThread(QThread):
 # Поэтому "паркуем" поток здесь: держим reference, отсоединяем от родителя,
 # и удаляем из пула когда finished. Тогда Qt спокойно его утилизирует.
 _PENDING_LOADERS: list = []
+# 1.31: все когда-либо стартовавшие IconLoaderThread (weak-ish set).
+# Используем обычный set — потоки сами уберутся из него по сигналу finished.
+_ALL_LOADERS: set = set()
+
+
+def shutdown_all_icon_loaders(timeout_ms: int = 600) -> None:
+    """Глушит ВСЕ живые IconLoaderThread (вызывается при выходе и при
+    закрытии Customization). cancel() -> wait(). Это снимает риск
+    fatal «QThread destroyed while thread is still running».
+    """
+    for th in list(_ALL_LOADERS):
+        try:
+            th.cancel()
+        except Exception:
+            pass
+    for th in list(_ALL_LOADERS):
+        try:
+            if th.isRunning():
+                th.wait(timeout_ms)
+        except Exception:
+            pass
 
 
 def _park_loader(th):
@@ -1035,8 +1056,16 @@ def _park_loader(th):
 class IconLoaderThread(QThread):
     """
     Загружает иконку проекта Modrinth в фоне.
-    Если карточка умирает раньше — поток отправляется в _PENDING_LOADERS
-    и тихо завершается сам, без эмита сигнала и без краша Qt.
+
+    1.31:
+      • При создании сразу регистрируется в _ALL_LOADERS — это нужно,
+        чтобы при выходе из приложения мы могли всем разом сделать
+        cancel()+wait() и не словить fatal «QThread destroyed while
+        thread is still running».
+      • _safe_emit оборачивает emit в try, чтобы любые исключения
+        (включая RuntimeError при удалённом Qt-объекте получателя)
+        не приводили к крашу.
+      • run() ВСЕГДА завершается чисто; никаких raise наружу.
     """
     done = pyqtSignal(object, object)
 
@@ -1046,6 +1075,11 @@ class IconLoaderThread(QThread):
         self.url = url
         self._alive = True
         self.setObjectName("IconLoader")
+        try:
+            _ALL_LOADERS.add(self)
+            self.finished.connect(lambda: _ALL_LOADERS.discard(self))
+        except Exception:
+            pass
 
     def cancel(self):
         """Помечает поток как ненужный — сигнал больше не эмитится."""
@@ -1057,25 +1091,38 @@ class IconLoaderThread(QThread):
         try:
             self.done.emit(self.card_id, pix)
         except Exception:
+            # Получатель уже мог быть удалён (deleteLater) — игнорируем.
             pass
 
     def run(self):
         try:
             req = urllib.request.Request(
-                self.url, headers={"User-Agent": "ExelentLauncher/3.0"})
+                self.url, headers={"User-Agent": f"ExelentLauncher/{APP_VERSION}"})
             with urllib.request.urlopen(req, timeout=6) as r:
                 data = r.read()
+            if not self._alive:
+                return
             pix = QPixmap()
-            pix.loadFromData(data)
+            try:
+                pix.loadFromData(data)
+            except Exception:
+                pix = QPixmap()
             if not pix.isNull():
-                pix = pix.scaled(52, 52,
-                                 Qt.AspectRatioMode.KeepAspectRatio,
-                                 Qt.TransformationMode.SmoothTransformation)
+                try:
+                    pix = pix.scaled(
+                        52, 52,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation)
+                except Exception:
+                    pass
                 self._safe_emit(pix)
                 return
         except Exception:
             pass
-        self._safe_emit(None)
+        try:
+            self._safe_emit(None)
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1477,40 +1524,74 @@ class ProjectCard(QFrame):
 
         icon_url = data.get("icon_url", "")
         if icon_url:
-            self._icon_thread = IconLoaderThread(id(self), icon_url, parent=self)
-            self._icon_thread.done.connect(self._on_icon)
-            self._icon_thread.start()
+            try:
+                self._icon_thread = IconLoaderThread(
+                    id(self), icon_url, parent=self)
+                # 1.31: QueuedConnection — гарантирует доставку в основной
+                # event loop. Если виджет к моменту доставки уже удалён,
+                # Qt просто проигнорирует слот.
+                self._icon_thread.done.connect(
+                    self._on_icon, Qt.ConnectionType.QueuedConnection)
+                self._icon_thread.start()
+            except Exception:
+                self._icon_thread = None
 
     def _on_icon(self, _cid, pix):
-        # Виджет мог уже умереть — проверяем
+        """1.31: viджет мог уже умереть — все обращения под try."""
         try:
-            if pix and not pix.isNull():
-                self._ico.setPixmap(pix)
-        except RuntimeError:
-            # C++ object deleted
-            return
+            if pix is not None:
+                try:
+                    is_null = pix.isNull()
+                except Exception:
+                    is_null = True
+                if not is_null:
+                    try:
+                        self._ico.setPixmap(pix)
+                    except Exception:
+                        # C++ объект уже удалён или _ico недоступен
+                        pass
         except Exception:
             pass
-        self._icon_thread = None
+        try:
+            self._icon_thread = None
+        except Exception:
+            pass
 
     def stop_thread(self):
         """
         Безопасная остановка фоновой загрузки иконки.
-        Если поток ещё в urlopen — паркуем его в глобальный пул, чтобы Qt
-        не словил фаталку 'QThread destroyed while still running'.
+
+        1.31: всё обёрнуто в try/except, чтобы НИ при каких условиях не
+        падало (например, если C++ объект уже удалён или сигнал
+        пытается прийти на мертвый виджет).
         """
-        t = self._icon_thread
-        self._icon_thread = None
+        try:
+            t = self._icon_thread
+        except Exception:
+            return
+        try:
+            self._icon_thread = None
+        except Exception:
+            pass
         if t is None:
             return
         try:
             t.cancel()
         except Exception:
             pass
-        if t.isRunning():
-            # Не разрушаем Python-объект потока — паркуем его
-            _park_loader(t)
-        # Если уже не running — обычный сборщик мусора уберёт
+        try:
+            # Отвязываем от Python-receiver, чтобы Qt не пытался дёрнуть
+            # _on_icon на удалённой карточке.
+            t.done.disconnect()
+        except Exception:
+            pass
+        try:
+            if t.isRunning():
+                # Парковка: держим reference, чтобы Qt-объект не был
+                # уничтожен раньше окончания run().
+                _park_loader(t)
+        except Exception:
+            pass
 
     def closeEvent(self, e):
         self.stop_thread()
@@ -1563,19 +1644,37 @@ class ResultsPage(QWidget):
         return self._grid
 
     def clear(self):
-        while self._grid.count():
-            item = self._grid.takeAt(0)
-            w = item.widget()
-            if w:
-                # Если это карточка — глушим её фоновый поток
+        """1.31: полностью защищённая очистка сетки."""
+        try:
+            while self._grid.count():
+                item = self._grid.takeAt(0)
+                try:
+                    w = item.widget() if item else None
+                except Exception:
+                    w = None
+                if w is None:
+                    continue
+                # Если это карточка — сначала глушим её IconLoader,
+                # ПОТОМ удаляем Qt-объект (порядок важен!).
                 if isinstance(w, ProjectCard):
                     try:
                         w.stop_thread()
                     except Exception:
                         pass
-                w.setParent(None)
-                w.deleteLater()
-        self._empty_lbl.hide()
+                try:
+                    w.setParent(None)
+                except Exception:
+                    pass
+                try:
+                    w.deleteLater()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            self._empty_lbl.hide()
+        except Exception:
+            pass
 
     def show_empty(self, text: str = "Ничего не найдено"):
         self.clear()
@@ -2038,18 +2137,30 @@ class ModrinthBrowser(QWidget):
         QMessageBox.critical(self, "Ошибка", err)
 
     def shutdown(self):
-        # 1. Гасим поиск/скачивание
-        for th in (self._search_thread, self._dl_thread):
-            if th and th.isRunning():
-                th.quit()
-                th.wait(400)
+        """1.31: полностью защищённая остановка ModrinthBrowser."""
+        # 1. Гасим поисковый и скачивающий потоки
+        for th in (getattr(self, "_search_thread", None),
+                   getattr(self, "_dl_thread", None)):
+            try:
+                if th and th.isRunning():
+                    th.quit()
+                    th.wait(400)
+            except Exception:
+                pass
         # 2. Гасим все карточки во всех страницах (там сидят IconLoaderThread)
         try:
-            for page in getattr(self, "_pages", {}).values():
-                if hasattr(page, "clear"):
-                    page.clear()
-            if hasattr(self, "_cat_results"):
-                self._cat_results.clear()
+            for page in (getattr(self, "_pages", {}) or {}).values():
+                try:
+                    if hasattr(page, "clear"):
+                        page.clear()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            cr = getattr(self, "_cat_results", None)
+            if cr is not None and hasattr(cr, "clear"):
+                cr.clear()
         except Exception:
             pass
 
@@ -2282,73 +2393,127 @@ class CustomizationDialog(ThemedDialog):
         self._on_profile_changed()
 
     def _on_profile_changed(self):
-        prof = self.prof_cb.currentData()
+        """1.31: всё под try, чтобы исключение в одном вызове не сломало
+        переключение профиля."""
+        try:
+            prof = self.prof_cb.currentData()
+        except Exception:
+            prof = None
         self._profile = prof
-        if not prof:
-            self.prof_info.setText("нет данных")
+        try:
+            if not prof:
+                try:
+                    self.prof_info.setText("нет данных")
+                except Exception:
+                    pass
+                self._refresh_mods_tab()
+                for page, sub in (
+                    (getattr(self, "rp_page", None), "resourcepacks"),
+                    (getattr(self, "sh_page", None), "shaderpacks"),
+                ):
+                    if page is None:
+                        continue
+                    try:
+                        page.set_target_dir(self._mc_dir / sub)
+                        page.set_mc_version("")
+                    except Exception:
+                        pass
+                try:
+                    if self.local_page is not None:
+                        self.local_page.set_mods_dir(self._mc_dir / "mods")
+                except Exception:
+                    pass
+                return
+
+            loader = prof.get("loader", "vanilla")
+            base   = prof.get("base", "?")
+            try:
+                self.prof_info.setText(f"{loader} · MC {base}")
+            except Exception:
+                pass
+
+            name = prof["name"]
+            try:
+                mods_d = profiles_mod.mods_dir(self._mc_dir, name)
+                rp_d   = profiles_mod.resourcepacks_dir(self._mc_dir, name)
+                sh_d   = profiles_mod.shaderpacks_dir(self._mc_dir, name)
+            except Exception:
+                return
+
+            for page, target in (
+                (getattr(self, "rp_page", None),    rp_d),
+                (getattr(self, "sh_page", None),    sh_d),
+            ):
+                if page is None:
+                    continue
+                try:
+                    page.set_target_dir(target)
+                    page.set_mc_version(base)
+                except Exception:
+                    pass
+            try:
+                if self.local_page is not None:
+                    self.local_page.set_mods_dir(mods_d)
+            except Exception:
+                pass
             self._refresh_mods_tab()
-            self.rp_page.set_target_dir(self._mc_dir / "resourcepacks")
-            self.rp_page.set_mc_version("")
-            self.sh_page.set_target_dir(self._mc_dir / "shaderpacks")
-            self.sh_page.set_mc_version("")
-            self.local_page.set_mods_dir(self._mc_dir / "mods")
-            return
-
-        loader = prof.get("loader", "vanilla")
-        base   = prof.get("base", "?")
-        self.prof_info.setText(f"{loader} · MC {base}")
-
-        name = prof["name"]
-        mods_d = profiles_mod.mods_dir(self._mc_dir, name)
-        rp_d   = profiles_mod.resourcepacks_dir(self._mc_dir, name)
-        sh_d   = profiles_mod.shaderpacks_dir(self._mc_dir, name)
-
-        self.rp_page.set_target_dir(rp_d)
-        self.rp_page.set_mc_version(base)
-
-        self.sh_page.set_target_dir(sh_d)
-        self.sh_page.set_mc_version(base)
-
-        self.local_page.set_mods_dir(mods_d)
-        self._refresh_mods_tab()
+        except Exception:
+            pass
 
     def _refresh_mods_tab(self):
-        if self.mods_tab_index >= 0:
-            try:
-                w = self.tabs.widget(0)
-                self.tabs.removeTab(0)
-                if w in self._pages:
-                    self._pages.remove(w)
+        """1.31: дополнительные try/except, чтобы исключение в одной
+        ветке не оставляло вкладку «Моды» в инвалидном состоянии."""
+        try:
+            if self.mods_tab_index >= 0:
+                w = None
+                try:
+                    w = self.tabs.widget(0)
+                    self.tabs.removeTab(0)
+                except Exception:
+                    w = None
+                try:
+                    if w is not None and w in self._pages:
+                        self._pages.remove(w)
+                except Exception:
+                    pass
                 # ВАЖНО: сначала останавливаем все потоки внутри браузера
-                if hasattr(w, "shutdown"):
+                if w is not None and hasattr(w, "shutdown"):
                     try:
                         w.shutdown()
                     except Exception:
                         pass
-                w.setParent(None)
-                w.deleteLater()
+                try:
+                    if w is not None:
+                        w.setParent(None)
+                        w.deleteLater()
+                except Exception:
+                    pass
+                self.mods_tab_index = -1
+                self.mods_page = None
+
+            prof = self._profile
+            t = self.theme
+            if prof and profiles_mod.supports_mods(prof):
+                mods_d = profiles_mod.mods_dir(self._mc_dir, prof["name"])
+                page = ModrinthBrowser(
+                    self._mc_dir, t, "mods", prof.get("base", ""),
+                    self._online, target_dir=mods_d,
+                    loader=prof.get("loader", "fabric"), parent=self)
+                self._pages.insert(0, page)
+                self.mods_page = page
+                self.tabs.insertTab(0, page, "Моды")
+            else:
+                page = NoModsPlaceholder(t, self)
+                self.mods_page = page
+                self.tabs.insertTab(0, page, "Моды")
+            self.mods_tab_index = 0
+            try:
+                self.tabs.setCurrentIndex(0)
             except Exception:
                 pass
-            self.mods_tab_index = -1
-            self.mods_page = None
-
-        prof = self._profile
-        t = self.theme
-        if prof and profiles_mod.supports_mods(prof):
-            mods_d = profiles_mod.mods_dir(self._mc_dir, prof["name"])
-            page = ModrinthBrowser(
-                self._mc_dir, t, "mods", prof.get("base", ""),
-                self._online, target_dir=mods_d,
-                loader=prof.get("loader", "fabric"), parent=self)
-            self._pages.insert(0, page)
-            self.mods_page = page
-            self.tabs.insertTab(0, page, "Моды")
-        else:
-            page = NoModsPlaceholder(t, self)
-            self.mods_page = page
-            self.tabs.insertTab(0, page, "Моды")
-        self.mods_tab_index = 0
-        self.tabs.setCurrentIndex(0)
+        except Exception:
+            # Никогда не падаем наружу — это закроет диалог в билде.
+            pass
 
     def _new_profile(self):
         win = self.parent()
@@ -2363,22 +2528,54 @@ class CustomizationDialog(ThemedDialog):
             self._reload_profiles()
 
     def closeEvent(self, e):
-        # Останавливаем все ModrinthBrowser'ы и LocalModsPage
-        for p in list(self._pages):
-            try:
-                if hasattr(p, "shutdown"):
-                    p.shutdown()
-            except Exception:
-                pass
-        # Дополнительно сами явно ссылающиеся
-        for attr in ("rp_page", "sh_page", "local_page", "mods_page"):
-            obj = getattr(self, attr, None)
-            if obj is not None and hasattr(obj, "shutdown"):
+        """1.31: полностью защищённое закрытие.
+
+        Раньше при закрытии до завершения IconLoader-потоков лаунчер
+        мог упасть в C++-слое. Теперь мы:
+          1) Глушим все потоки внутри страниц (shutdown).
+          2) Глушим ВСЕ глобально живые IconLoader-потоки.
+          3) Сбрасываем все ссылки на страницы (чтобы Qt не пытался
+             их рендерить после remove).
+          4) Любые исключения молча проглатываются, чтобы не
+             вылетать наружу.
+        """
+        try:
+            for page in list(getattr(self, "_pages", []) or []):
                 try:
-                    obj.shutdown()
+                    if hasattr(page, "shutdown"):
+                        page.shutdown()
                 except Exception:
                     pass
-        super().closeEvent(e)
+        except Exception:
+            pass
+
+        for attr in ("rp_page", "sh_page", "local_page", "mods_page"):
+            try:
+                obj = getattr(self, attr, None)
+                if obj is not None and hasattr(obj, "shutdown"):
+                    obj.shutdown()
+            except Exception:
+                pass
+
+        # Глушим оставшихся ленивых IconLoader'ов глобально.
+        try:
+            shutdown_all_icon_loaders(timeout_ms=400)
+        except Exception:
+            pass
+
+        # Сбросим ссылки, чтобы Qt не дёргал слоты на удалённых страницах.
+        try:
+            self._pages = []
+        except Exception:
+            pass
+
+        try:
+            super().closeEvent(e)
+        except Exception:
+            try:
+                e.accept()
+            except Exception:
+                pass
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -5704,6 +5901,14 @@ def main():
             w.grab().save(str(APP_DIR / "screenshot.png")),
             print("Saved screenshot.png"),
         ))
+
+    # 1.31: при выходе из приложения глушим все живые IconLoader-потоки
+    # ДО уничтожения Python-объектов — иначе Qt валит fatal
+    # «QThread destroyed while thread is still running».
+    try:
+        app.aboutToQuit.connect(lambda: shutdown_all_icon_loaders(800))
+    except Exception:
+        pass
 
     sys.exit(app.exec())
 

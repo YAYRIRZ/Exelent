@@ -517,7 +517,7 @@ class InstallThread(QThread):
                     # При обновлении лаунчер увидит config_version < CONFIG_VERSION
                     # и применит миграции, не теряя пользовательские настройки.
                     "config_version":   2,
-                    "launcher_version": "1.2",
+                    "launcher_version": "1.31",
                 }
                 cfg_path.write_text(
                     json.dumps(default_cfg, indent=2, ensure_ascii=False),
