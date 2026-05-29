@@ -1,7 +1,7 @@
 {
   "username": "Player",
   "mc_dir": "E:\\Рабочий стол\\ExelLauncher\\.ExelLauncher",
-  "last_version": "fabric-loader-0.19.2-1.16.5",
+  "last_version": "fabric-loader-0.19.2-1.21.11",
   "ram_mb": 2048,
   "show_snapshots": false,
   "theme": "mono",
@@ -20,7 +20,7 @@
     "1.16.5"
   ],
   "ask_sodium": true,
-  "last_profile": "MyPack",
+  "last_profile": "Optimized",
   "progress_style": "glow",
   "ui_style": "full",
   "show_monitoring": true,
@@ -30,5 +30,6 @@
   "config_version": 2,
   "launcher_version": "1.2",
   "server_address": "",
-  "show_server_card": true
+  "show_server_card": true,
+  "optimizedstart": true
 }

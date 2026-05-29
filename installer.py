@@ -139,6 +139,26 @@ def desktop_path() -> Path:
     return Path.home() / "Desktop"
 
 
+def save_installed_info(install_dir: Path) -> None:
+    """Записывает путь install_dir в %USERPROFILE%/exelent/installed_info.txt.
+    На Linux/Mac: ~/.exelent/installed_info.txt.
+
+    main.py при следующем запуске прочитает этот файл и сразу запустит
+    лаунчер из install_dir, не показывая инсталлер повторно.
+    """
+    if sys.platform == "win32":
+        base = Path(os.environ.get(
+            "USERPROFILE", os.path.expanduser("~"))) / "exelent"
+    else:
+        base = Path(os.path.expanduser("~")) / ".exelent"
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        (base / "installed_info.txt").write_text(
+            str(Path(install_dir).resolve()), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def create_shortcut_windows(exe_path: Path, install_dir: Path,
                             icon_path: Path | None = None) -> str:
     desk = desktop_path()
@@ -931,6 +951,11 @@ class Installer(QWidget):
     def _on_success(self, install_dir: str, shortcut_msg: str):
         self.progress.setValue(100)
         self.status_lbl.setText("Установка завершена")
+        # Сохраняем путь установки — main.py больше не покажет инсталлер
+        try:
+            save_installed_info(Path(install_dir))
+        except Exception:
+            pass
         QMessageBox.information(
             self, "Готово",
             f"Exelent Launcher установлен в:\n{install_dir}\n\n"

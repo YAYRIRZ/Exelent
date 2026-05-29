@@ -546,8 +546,7 @@ def _rename_minecraft_window(root_pid: int, new_title: str = WINDOW_TITLE,
 def launch_minecraft(version: str, username: str, mc_dir: Path, ram_mb: int = 2048,
                      java_path: Optional[str] = None, dev_mode: bool = False,
                      game_dir: Optional[Path] = None,
-                     server: Optional[str] = None,
-                     jvm_args: Optional[list] = None) -> subprocess.Popen:
+                     server: Optional[str] = None) -> subprocess.Popen:
     """
     Запуск Minecraft.
 
