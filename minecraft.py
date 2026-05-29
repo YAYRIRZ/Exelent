@@ -570,12 +570,14 @@ def launch_minecraft(version: str, username: str, mc_dir: Path, ram_mb: int = 20
         "launcherName":    LAUNCHER_BRAND,
         "launcherVersion": LAUNCHER_VER,
         "gameDirectory":   game_directory,
-        "jvmArguments": [
-            f"-Xmx{ram_mb}M",
-            f"-Xms{min(512, ram_mb)}M",
-            f"-Dminecraft.launcher.brand={LAUNCHER_BRAND}",
-            f"-Dminecraft.launcher.version={LAUNCHER_VER}",
-        ],
+        "jvmArguments": (
+            jvm_args if jvm_args else [
+                f"-Xmx{ram_mb}M",
+                f"-Xms{min(512, ram_mb)}M",
+                f"-Dminecraft.launcher.brand={LAUNCHER_BRAND}",
+                f"-Dminecraft.launcher.version={LAUNCHER_VER}",
+            ]
+        ),
     }
     if java_path:
         options["executablePath"] = java_path

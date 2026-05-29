@@ -28,6 +28,9 @@ import themes as themes_mod
 from icons import svg_icon, svg_pixmap
 from widgets import SnakeProgress, BorderOverlay, ProgressBar, PROGRESS_STYLES
 import profiles as profiles_mod
+import server as server_mod
+import zipfile
+import io
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -78,7 +81,8 @@ DEFAULT_CONFIG = {
     "ask_sodium":       True,
     "last_profile":     "",
     "progress_style":   "bar",
-    "ui_style":         "classic",   # "classic" | "lunar"
+    "ui_style":         "classic",   # "classic" | "full"
+    "show_monitoring":  True,        # показывать вкладку мониторинга
     "sidebar_width":    68,          # ширина sidebar в Lunar (px)
     "border_width":     6,           # ширина обводки окна (px)
     # Java overrides: {mc_version: java_path} — если есть, запускаем без вопросов
@@ -838,13 +842,23 @@ class LaunchThread(QThread):
     ok     = pyqtSignal()
     failed = pyqtSignal(str)
 
-    def __init__(self, version, username, mc_dir, ram, java):
+    def __init__(self, version, username, mc_dir, ram, java, game_dir=None, server=None):
         super().__init__()
-        self.args = (version, username, Path(mc_dir), ram, java, False)
+        self._version = version
+        self._username = username
+        self._mc_dir = Path(mc_dir)
+        self._ram = ram
+        self._java = java
+        self._game_dir = Path(game_dir) if game_dir else None
+        self._server = server
 
     def run(self):
         try:
-            mc.launch_minecraft(*self.args)
+            mc.launch_minecraft(
+                self._version, self._username, self._mc_dir,
+                self._ram, self._java, False,
+                game_dir=self._game_dir, server=self._server,
+                jvm_args=LauncherWindow._jvm_args(self._ram))
             self.ok.emit()
         except Exception as ex:
             self.failed.emit(str(ex))
@@ -1847,6 +1861,14 @@ class ModrinthBrowser(QWidget):
         elif tid == "search":
             self._do_search()
 
+    @staticmethod
+    def _safe_hide_prog(prog):
+        try:
+            if prog is not None:
+                prog.hide()
+        except Exception:
+            pass
+
     def _run_search(self, query: str = "", categories=None,
                     index: str = "downloads",
                     results_page=None):
@@ -1872,22 +1894,37 @@ class ModrinthBrowser(QWidget):
             offset=self._page * self._page_sz,
         )
         rp = results_page
+        btn_next = self._btn_next
+        prog = self._prog
+        status = self._status
 
         def on_results(res):
-            self._prog.hide()
-            self._btn_next.setEnabled(len(res) == self._page_sz)
+            try:
+                if prog is not None: prog.hide()
+            except Exception: pass
+            try:
+                btn_next.setEnabled(len(res) == self._page_sz)
+            except (RuntimeError, Exception): pass
             if not res:
-                self._status.setText("Ничего не найдено")
+                try: status.setText("Ничего не найдено")
+                except (RuntimeError, Exception): pass
                 if rp:
-                    rp.show_empty()
+                    try: rp.show_empty()
+                    except (RuntimeError, Exception): pass
             else:
-                self._status.setText(f"{len(res)} проектов")
+                try: status.setText(f"{len(res)} проектов")
+                except (RuntimeError, Exception): pass
                 if rp:
-                    rp.fill(res, self._mc_version, self._download)
+                    try: rp.fill(res, self._mc_version, self._download)
+                    except (RuntimeError, Exception): pass
 
         def on_err(err):
-            self._prog.hide()
-            self._status.setText(f"Ошибка: {err[:60]}")
+            try:
+                if prog is not None: prog.hide()
+            except Exception: pass
+            try:
+                status.setText(f"Ошибка: {err[:60]}")
+            except (RuntimeError, Exception): pass
             if rp:
                 rp.show_empty(f"Ошибка: {err[:60]}")
 
@@ -1929,12 +1966,10 @@ class ModrinthBrowser(QWidget):
         name = Path(path).name
         self._status.setText(f"Сохранено: {name}")
         self._prog.setValue(100)
-        QTimer.singleShot(500, self._prog.hide)
         QMessageBox.information(self, "Готово", f"Сохранено:\n{name}")
 
     def _dl_fail(self, err: str):
         self._status.setText(f"Ошибка: {err[:60]}")
-        self._prog.hide()
         QMessageBox.critical(self, "Ошибка", err)
 
     def shutdown(self):
@@ -2363,7 +2398,6 @@ class SodiumOfferDialog(ThemedDialog):
         QTimer.singleShot(1200, self.accept)
 
     def _fail(self, err: str):
-        self._prog.hide()
         self._st.setText(f"Ошибка: {err[:50]}")
 
 
@@ -2513,6 +2547,9 @@ class SettingsDialog(ThemedDialog):
         self.snap = QCheckBox("Показывать снапшоты")
         self.snap.setChecked(bool(self.cfg.get("show_snapshots")))
         self.snap.setStyleSheet(iss)
+        self.show_monitoring = QCheckBox("Показывать вкладку Мониторинг")
+        self.show_monitoring.setChecked(bool(self.cfg.get("show_monitoring", True)))
+        self.show_monitoring.setStyleSheet(iss)
         self.news_cb = QCheckBox("Показывать новости")
         self.news_cb.setChecked(bool(self.cfg.get("show_news", True)))
         self.news_cb.setStyleSheet(iss)
@@ -2520,6 +2557,7 @@ class SettingsDialog(ThemedDialog):
         self.ask_sodium_cb.setChecked(bool(self.cfg.get("ask_sodium", True)))
         self.ask_sodium_cb.setStyleSheet(iss)
         lay.addWidget(self.snap)
+        lay.addWidget(self.show_monitoring)
         lay.addWidget(self.news_cb)
         lay.addWidget(self.ask_sodium_cb)
         lay.addSpacing(8)
@@ -2533,8 +2571,8 @@ class SettingsDialog(ThemedDialog):
         f3.setContentsMargins(6, 6, 6, 6)
         f3.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.ui_style_cb = QComboBox()
-        self.ui_style_cb.addItem("Классическая (центр)", "classic")
-        self.ui_style_cb.addItem("Lunar (sidebar слева)", "lunar")
+        self.ui_style_cb.addItem("Classic (центр)", "classic")
+        self.ui_style_cb.addItem("Full (sidebar + мониторинг)", "full")
         cur_ui = self.cfg.get("ui_style", "classic")
         idx_ui = self.ui_style_cb.findData(cur_ui)
         if idx_ui >= 0:
@@ -3060,7 +3098,7 @@ class LauncherWindow(QWidget):
             root.addWidget(ob)
 
         ui_style = self.cfg.get("ui_style", "classic")
-        if ui_style == "lunar":
+        if ui_style == "full":
             root.addWidget(self._build_lunar_body(), 1)
             # КЛЮЧЕВОЕ: после построения lunar body поднимаем overlay
             # ещё раз — он должен быть НА САМОМ ВЕРХУ всех виджетов
@@ -3131,11 +3169,16 @@ class LauncherWindow(QWidget):
         # Вертикальные кнопки-иконки
         sidebar_btns = [
             ("rocket",   "Главная",      lambda: None),
+            ("server",   "Мониторинг",   self._show_server_browser) if self.cfg.get("show_monitoring", True) else None,
             ("puzzle",   "Кастомизация", self._show_customization),
+            ("brush",    "Сборки",       self._show_expack_browser),
             ("package",  "Профили",      self._new_profile_btn),
             ("folder",   "Папка",        lambda: open_folder(self.mc_dir)),
         ]
-        for ico, tip, cb in sidebar_btns:
+        for item in sidebar_btns:
+            if item is None:
+                continue
+            ico, tip, cb = item
             btn = self._lunar_side_btn(ico, tip)
             btn.clicked.connect(cb)
             sl.addWidget(btn)
@@ -3413,10 +3456,10 @@ class LauncherWindow(QWidget):
         hrow.addWidget(hico); hrow.addWidget(hl); hrow.addStretch()
         lay.addLayout(hrow)
         news = [
-            ("Профили",      "Каждый профиль — своя папка модов и тп."),
-            ("Кастомизация", "Моды, текстуры и шейдеры — в одном окне."),
-            ("Sodium",       "Предлагается при установке Fabric."),
-            ("Офлайн",       "Можно играть без интернета."),
+            ("Мониторинг",  "Список серверов + быстрый вход."),
+            ("Сборки",      "Каталог готовых сборок модов."),
+            ("Кастомизация","Моды, текстуры и шейдеры."),
+            ("Sodium",      "Предлагается при установке Fabric."),
         ]
         for a, b_ in news:
             l = QLabel(f"<b>{a}</b>: {b_}")
@@ -3849,6 +3892,75 @@ class LauncherWindow(QWidget):
         dlg.exec()
         QTimer.singleShot(200, lambda: self._launch(self.current_version))
 
+    # ── SYSTEM DETECTION & JVM OPTIMIZATION ──
+
+    @staticmethod
+    def _system_ram() -> int:
+        """Total RAM in MB."""
+        try:
+            import os as _os
+            if sys.platform == "win32":
+                try:
+                    import ctypes.wintypes as _w
+                    class MEMORYSTATUSEX(_w.Structure):
+                        _fields_ = [("dwLength",_w.DWORD),("dwMemoryLoad",_w.DWORD),
+                            ("ullTotalPhys",ctypes.c_ulonglong),("ullAvailPhys",ctypes.c_ulonglong),
+                            ("ullTotalPageFile",ctypes.c_ulonglong),("ullAvailPageFile",ctypes.c_ulonglong),
+                            ("ullTotalVirtual",ctypes.c_ulonglong),("ullAvailVirtual",ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual",ctypes.c_ulonglong)]
+                    ms = MEMORYSTATUSEX()
+                    ms.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+                    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
+                    return int(ms.ullTotalPhys // (1024*1024))
+                except Exception:
+                    pass
+            else:
+                with open("/proc/meminfo") as f:
+                    for line in f:
+                        if "MemTotal" in line:
+                            return int(line.split()[1]) // 1024
+        except Exception:
+            pass
+        return 2048  # fallback 2 GB
+
+    @staticmethod
+    def _auto_ram() -> int:
+        """Auto-detect best RAM for Minecraft (max 4GB, min 2GB, 50% of system)."""
+        total = LauncherWindow._system_ram()
+        half = total // 2
+        if half >= 4096:
+            return 4096
+        if half >= 2048:
+            return half
+        return 2048
+
+    @staticmethod
+    def _jvm_args(ram_mb: int) -> list:
+        """Build optimized JVM arguments for the given RAM."""
+        return [
+            f"-Xmx{ram_mb}M",
+            f"-Xms{min(512, ram_mb // 4)}M",
+            "-XX:+UseG1GC",
+            "-XX:+ParallelRefProcEnabled",
+            "-XX:MaxGCPauseMillis=20",
+            "-XX:+UnlockExperimentalVMOptions",
+            "-XX:+AlwaysPreTouch",
+            "-XX:G1NewSizePercent=30",
+            "-XX:G1MaxNewSizePercent=40",
+            "-XX:G1HeapRegionSize=8m",
+            "-XX:G1ReservePercent=20",
+            "-XX:G1HeapWastePercent=5",
+            "-XX:G1MixedGCCountTarget=4",
+            "-XX:InitiatingHeapOccupancyPercent=15",
+            "-XX:G1MixedGCLiveThresholdPercent=90",
+            "-XX:G1RSetUpdatingPauseTimePercent=5",
+            "-XX:SurvivorRatio=32",
+            "-XX:+PerfDisableSharedMem",
+            "-XX:MaxTenuringThreshold=1",
+            f"-Dminecraft.launcher.brand={mc.LAUNCHER_BRAND}",
+            f"-Dminecraft.launcher.version={mc.LAUNCHER_VER}",
+        ]
+
     @staticmethod
     def _base_mc_version(vid: str) -> str:
         if "-" not in vid:
@@ -3946,69 +4058,80 @@ class LauncherWindow(QWidget):
                 return str(c)
         return None
 
+
+    # ── PORTABLE JAVA ──
+    def _resolve_java(self, need_java: int) -> str | None:
+        """Find or download portable Java."""
+        user_path = self.cfg.get("java_path","").strip()
+        if user_path and Path(user_path).exists():
+            mj = self._java_major(user_path)
+            if mj and mj >= need_java:
+                return user_path
+        try:
+            sys_java = mc.find_java(user_path) if user_path else mc.find_java()
+        except Exception:
+            sys_java = None
+        if sys_java:
+            mj = self._java_major(sys_java)
+            if mj is not None and mj >= need_java:
+                return sys_java
+        portable = mc.find_portable_java(APP_DIR, need_java)
+        if portable:
+            return portable
+        if not sys_java or (self._java_major(sys_java) is not None and self._java_major(sys_java) <= 12):
+            self.dl_label.setText(f"Download Java {need_java}...")
+            self.progress.setIndeterminate(True)
+            QApplication.processEvents()
+            result = mc.download_portable_java(APP_DIR, need_java,
+                on_progress=lambda pct, s: self.progress.setValue(pct))
+            self.progress.setValue(0)
+            if result:
+                return result
+        return sys_java
+
     def _launch(self, version: str):
         need_java = self._required_java(version)
         base_ver = self._base_mc_version(version)
 
-        # 1. ПРИОРИТЕТ: ранее одобренный override для этой версии
+        # 1. Override
         overrides = self.cfg.get("java_overrides", {}) or {}
         saved_java = overrides.get(base_ver) or overrides.get(version)
         if saved_java and Path(saved_java).exists():
-            java = saved_java
-            current_major = self._java_major(java)
-            self._do_launch(version, java)
+            self._do_launch(version, saved_java)
             return
 
-        # 2. Указанный в настройках Java
-        user_path = self.cfg.get("java_path", "").strip()
-        try:
-            java = mc.find_java(user_path) if user_path else mc.find_java()
-        except Exception:
-            java = None
-        current_major = self._java_major(java) if java else None
-
-        # 3. Если несовпадение — пробуем найти подходящую
-        if current_major is None or current_major < need_java:
-            better = self._find_compatible_java(need_java)
-            if better:
-                java = better
-                current_major = need_java
-
-        # 4. Если до сих пор Java нет — ошибка
+        # 2. Find or download Java
+        java = self._resolve_java(need_java)
         if not java:
             QMessageBox.warning(
                 self, "Java",
-                f"Java не найдена.\n"
-                f"Для MC {base_ver} нужна Java {need_java}.\n"
-                f"Укажите путь в настройках.")
+                f"Java not found.\\n"
+                f"MC {base_ver} needs Java {need_java}.")
             self.btn_play.setEnabled(True)
             self.btn_play.setText("ИГРАТЬ")
+            self.progress.setValue(0)
             return
 
-        # 5. ПРАВИЛО: если Java БОЛЬШЕ или РАВНА требуемой — не спрашиваем
+        current_major = self._java_major(java) if java else None
+
+        # 3. Java >= required — launch
         if current_major is not None and current_major >= need_java:
             self._do_launch(version, java)
             return
 
-        # 6. Java меньше требуемой — спрашиваем (один раз, потом запоминаем)
+        # 4. Ask once
         res = QMessageBox.question(
-            self, "Java несовместима",
-            f"Для Minecraft {base_ver} нужна Java {need_java}, "
-            f"а найдена Java {current_major}.\n\n"
-            f"Установи Java {need_java}:\n"
-            f"  Java 8:  adoptium.net/temurin/releases?version=8\n"
-            f"  Java 17: adoptium.net/temurin/releases?version=17\n"
-            f"  Java 21: adoptium.net/temurin/releases?version=21\n\n"
-            f"Если нажмёшь «Да» — больше не спросим для этой версии.\n"
-            f"Запустить?",
+            self, "Java mismatch",
+            f"MC {base_ver} needs Java {need_java}, found Java {current_major}.\\n\\n"
+            f"Launch anyway? (won't ask again for this version)",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
         if res != QMessageBox.StandardButton.Yes:
             self.btn_play.setEnabled(True)
             self.btn_play.setText("ИГРАТЬ")
+            self.progress.setValue(0)
             return
 
-        # Запоминаем согласие: для этой версии запускаем с этой Java без вопросов
         overrides[base_ver] = java
         self.cfg["java_overrides"] = overrides
         save_config(self.cfg)
@@ -4016,14 +4139,23 @@ class LauncherWindow(QWidget):
         self._do_launch(version, java)
 
     def _do_launch(self, version: str, java: str):
-        """Финальный запуск (без диалогов)."""
+        """Финальный запуск (без диалогов) с оптимизированными JVM-аргументами."""
 
         self.dl_label.setText(f"Запуск {version}...")
         self.progress.setValue(100)
         self.btn_play.setEnabled(False)
+
+        game_dir = None
+        last_profile = self.cfg.get("last_profile","")
+        if last_profile:
+            pdir = profiles_mod.profile_dir(self.mc_dir, last_profile)
+            if pdir.exists():
+                game_dir = pdir
+
+        ram_mb = int(self.cfg.get("ram_mb", 2048))
         self._launch_thread = LaunchThread(
             version, self.nick.text(), self.mc_dir,
-            int(self.cfg.get("ram_mb", 2048)), java)
+            ram_mb, java, game_dir=game_dir)
         self._launch_thread.ok.connect(self._launch_ok)
         self._launch_thread.failed.connect(self._fail)
         self._launch_thread.start()
@@ -4051,6 +4183,12 @@ class LauncherWindow(QWidget):
         QMessageBox.critical(self, "Ошибка", err)
 
     # ── Dialogs ──
+    def _show_expack_browser(self):
+        ExpackBrowser(self.theme, self.mc_dir, self.online, self).exec()
+
+    def _show_server_browser(self):
+        ServerBrowserDialog(self.theme, self.mc_dir, self.online, self).exec()
+
     def _show_settings(self):
         old_snap = self.cfg.get("show_snapshots")
         dlg = SettingsDialog(self.cfg, self.theme, self.online, self)
@@ -4099,6 +4237,567 @@ class LauncherWindow(QWidget):
 # ═══════════════════════════════════════════════════════════════
 #  SplashScreen — заставка при запуске лаунчера
 # ═══════════════════════════════════════════════════════════════
+
+
+# ═══════════════════════════════════════════════════════════
+# ServerBrowserDialog — мониторинг серверов
+# ═══════════════════════════════════════════════════════════
+
+# Популярные серверы (фолбэк если не загрузился список)
+_SERVER_BOOK = [
+    ("Hypixel",    "mc.hypixel.net"),
+    ("Mineland",   "mineland.net"),
+    ("ReallyWorld","reallyworld.ru"),
+    ("2b2t",       "2b2t.org"),
+    ("Wynncraft",  "play.wynncraft.com"),
+]
+
+SERVER_LIST_URL = "https://raw.githubusercontent.com/YAYRIRZ/Exelent/refs/heads/main/servers.json"
+
+def _fetch_server_list() -> list:
+    """Динамическая загрузка списка серверов с GitHub."""
+    import urllib.request, json
+    try:
+        req = urllib.request.Request(
+            SERVER_LIST_URL,
+            headers={"User-Agent": "ExelentLauncher/1.3"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read().decode("utf-8"))
+            if isinstance(data, list) and data:
+                return [(s["name"], s["ip"]) for s in data if "name" in s and "ip" in s]
+    except Exception:
+        pass
+    return _SERVER_BOOK
+
+class ServerBrowserDialog(ThemedDialog):
+    """Мониторинг серверов: популярные + свой."""
+
+    def __init__(self, theme: dict, mc_dir, online: bool, parent=None):
+        super().__init__(theme, "Мониторинг серверов", parent, width=760, height=600)
+        self._mc_dir = mc_dir
+        self._online = online
+        self._threads = []
+        self._cards = {}
+        self._build()
+
+    def _build(self):
+        t = self.theme
+
+        hrow = QHBoxLayout()
+        hrow.setSpacing(8)
+        self._addr = QLineEdit()
+        self._addr.setPlaceholderText("Server IP...")
+        self._addr.setStyleSheet(_input_ss(t))
+        self._addr.returnPressed.connect(self._check_custom)
+        hrow.addWidget(self._addr, 1)
+        check_btn = MD3Button("Check", t, True, "search", 15)
+        check_btn.clicked.connect(self._check_custom)
+        hrow.addWidget(check_btn)
+        self.content_layout.addLayout(hrow)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet(f"QScrollArea{{background:transparent;border:none;}}{_sb_ss(t)}")
+        cw = QWidget()
+        cw.setStyleSheet("background:transparent;")
+        self._grid = QGridLayout(cw)
+        self._grid.setSpacing(10)
+        self._grid.setContentsMargins(0, 8, 0, 0)
+        self._grid.setAlignment(Qt.AlignmentFlag.AlignTop)
+        scroll.setWidget(cw)
+        self.content_layout.addWidget(scroll, 1)
+
+        hdr = QLabel("Popular servers:")
+        hdr.setStyleSheet(f"color:{t['accent']};font:700 10pt '{F()}';background:transparent;")
+        self.content_layout.addWidget(hdr)
+
+        for idx, (name, addr) in enumerate(_fetch_server_list()):
+            card = self._make_server_card(name, addr)
+            self._grid.addWidget(card, idx // 2, idx % 2)
+            self._cards[addr] = card
+            th = server_mod.ServerStatusThread(addr)
+            th.done.connect(lambda a, d, n=name, c=card: self._update_card(n, c, d))
+            th.start()
+            self._threads.append(th)
+
+        close = MD3Button("Close", t, False, "close", 14)
+        close.clicked.connect(self.reject)
+        self.add_button_row(close)
+
+    def _make_server_card(self, name: str, addr: str) -> QFrame:
+        t = self.theme
+        r, g, b = t["glow_rgb"]
+        card = QFrame()
+        card.setMinimumHeight(100)
+        card.setStyleSheet(f"""
+            QFrame{{background:{t["bg_panel2"]};border:1px solid {t["primary_dark"]};border-radius:12px;}}
+            QFrame:hover{{border-color:{t["accent"]};background:rgba({r},{g},{b},0.06);}}
+        """)
+        lay = QHBoxLayout(card)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(12)
+
+        ico = QLabel()
+        ico.setFixedSize(52, 52)
+        ico.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ico.setPixmap(svg_pixmap("server", 28, t["accent"]))
+        ico.setStyleSheet(f"background:{t['bg_panel']};border:1px solid {t['primary_dark']};border-radius:8px;")
+        ico.setObjectName(f"ico_{addr}")
+        lay.addWidget(ico, 0)
+
+        info = QVBoxLayout()
+        info.setSpacing(4)
+        nl = QLabel(name)
+        nl.setStyleSheet(f"color:{t['accent']};font:700 11pt '{F()}';background:transparent;")
+        nl.setObjectName(f"name_{addr}")
+        info.addWidget(nl)
+        al = QLabel(addr)
+        al.setStyleSheet(f"color:{t['text_dim']};font:8pt '{F()}';background:transparent;")
+        info.addWidget(al)
+        ml = QLabel("Loading...")
+        ml.setWordWrap(True)
+        ml.setStyleSheet(f"color:{t['text_dim']};font:9pt '{F()}';background:transparent;")
+        ml.setObjectName(f"motd_{addr}")
+        info.addWidget(ml)
+        pl = QLabel("... / ...")
+        pl.setStyleSheet(f"color:{t['accent_light']};font:700 9pt '{F()}';background:transparent;")
+        pl.setObjectName(f"players_{addr}")
+        info.addWidget(pl)
+        lay.addLayout(info, 1)
+
+        pb = MD3Button("PLAY", t, True, "play", 14)
+        pb.setFixedWidth(80)
+        pb.clicked.connect(lambda _=False, a=addr: self._join_server(a))
+        pb.setObjectName(f"btn_{addr}")
+        lay.addWidget(pb, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        return card
+
+    def _update_card(self, name: str, card: QFrame, data):
+        if data and data.get("online"):
+            motd = server_mod.get_motd_text(data)
+            players = server_mod.get_players_text(data)
+            ver = server_mod.get_version_text(data)
+            pix = server_mod.get_icon_pixmap(data, 48)
+        else:
+            motd = "Offline"
+            players = "offline"
+            ver = ""
+            pix = None
+
+        addr_key = None
+        for a, c in self._cards.items():
+            if c is card:
+                addr_key = a
+                break
+        if addr_key is None:
+            return
+
+        for child in card.findChildren(QLabel):
+            oname = child.objectName()
+            if oname == f"motd_{addr_key}":
+                child.setText(motd)
+            elif oname == f"players_{addr_key}":
+                child.setText(f"{players}  {ver}")
+
+        if pix:
+            for child in card.findChildren(QLabel):
+                if child.objectName() == f"ico_{addr_key}":
+                    child.setPixmap(pix)
+
+    def _check_custom(self):
+        addr = (self._addr.text() or "").strip()
+        if not addr:
+            return
+        card = self._make_server_card(addr, addr)
+        cnt = self._grid.count()
+        self._grid.addWidget(card, cnt // 2, cnt % 2)
+        self._cards[addr] = card
+        th = server_mod.ServerStatusThread(addr)
+        th.done.connect(lambda a, d, n=addr, c=card: self._update_card(n, c, d))
+        th.start()
+        self._threads.append(th)
+
+    def _join_server(self, addr: str):
+        win = self.parent()
+        while win and not isinstance(win, LauncherWindow):
+            win = win.parent()
+        if win is None:
+            QMessageBox.information(self, "Error", "Main window not found.")
+            return
+
+        win._save_nick()
+        target = win.current_version
+        try:
+            already = mc.is_version_installed(win.mc_dir, target)
+        except Exception:
+            already = False
+        if not already:
+            QMessageBox.information(self, "Not installed",
+                                    f"Version {target} not installed.")
+            return
+
+        need_java = LauncherWindow._required_java(target)
+        java = win._find_compatible_java(need_java)
+        if not java:
+            QMessageBox.warning(self, "Java", "Java not found.")
+            return
+
+        win.dl_label.setText(f"Launch → {addr}...")
+        win.progress.setValue(100)
+        win.btn_play.setEnabled(False)
+
+        game_dir = None
+        last_profile = win.cfg.get("last_profile","")
+        if last_profile:
+            pdir = profiles_mod.profile_dir(win.mc_dir, last_profile)
+            if pdir.exists():
+                game_dir = pdir
+
+        win._launch_thread = LaunchThread(
+            target, win.nick.text(), win.mc_dir,
+            int(win.cfg.get("ram_mb", 2048)), java,
+            game_dir=game_dir, server=addr)
+        win._launch_thread.ok.connect(win._launch_ok)
+        win._launch_thread.failed.connect(win._fail)
+        win._launch_thread.start()
+        self.accept()
+
+    def closeEvent(self, e):
+        for th in self._threads:
+            if th.isRunning():
+                th.cancel()
+                th.wait(200)
+        super().closeEvent(e)
+
+# ═══════════════════════════════════════════════════════════
+# ExpackBrowser — каталог сборок (.expack)
+# ═══════════════════════════════════════════════════════════
+
+EX_PACK_URL = "https://raw.githubusercontent.com/YAYRIRZ/Exelent/main/sborki/{name}.expack"
+_EXPACK_CACHE = {}
+
+def _fetch_expack_list() -> list:
+    """Загрузка списка сборок с GitHub."""
+    import urllib.request, json
+    url = "https://raw.githubusercontent.com/YAYRIRZ/Exelent/refs/heads/main/sborki/list.json"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "ExelentLauncher/1.3"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read().decode("utf-8"))
+            if isinstance(data, list):
+                return data
+    except Exception:
+        pass
+    return []
+
+def _parse_expack(data: bytes) -> dict | None:
+    """Разбор .expack (zip) файла. Поддерживает файлы в корне и в подпапке."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            names = zf.namelist()
+
+            # Найти info.txt (может быть в корне или в подпапке Optimized/info.txt)
+            info_candidates = [n for n in names if n.endswith("info.txt")]
+            if not info_candidates:
+                return None
+            info_raw = zf.read(info_candidates[0]).decode("utf-8")
+
+            # desc.txt
+            desc_raw = ""
+            desc_candidates = [n for n in names if n.endswith("desc.txt")]
+            if desc_candidates:
+                desc_raw = zf.read(desc_candidates[0]).decode("utf-8")
+
+            # banner.png
+            banner = None
+            banner_candidates = [n for n in names if n.endswith("banner.png")]
+            if banner_candidates:
+                banner = zf.read(banner_candidates[0])
+
+            # mods/*.jar — ищем в любых подпапках
+            mods = [n for n in names if n.endswith(".jar")]
+
+            # Определить префикс подпапки (для извлечения модов)
+            prefix = ""
+            if info_candidates[0] != "info.txt":
+                prefix = info_candidates[0].replace("info.txt", "")
+
+        info = {}
+        for line in info_raw.replace("\r","").split("\n"):
+            line = line.strip()
+            if ":" in line and not line.startswith("http"):
+                k, v = line.split(":", 1)
+                info[k.strip()] = v.strip()
+
+        import re
+        desc = re.sub(r"__(.+?)__", r"<b>\1</b>", desc_raw)
+        desc = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", desc)
+
+        info["desc"] = desc
+        info["banner"] = banner
+        info["mods_count"] = len(mods)
+        info["mods"] = mods
+        info["_prefix"] = prefix  # для извлечения модов
+        return info
+    except Exception as e:
+        print(f"_parse_expack error: {e}")
+        return None
+
+class ExpackCard(QFrame):
+    """Карточка сборки."""
+    install_requested = pyqtSignal(dict)
+
+    def __init__(self, name: str, theme: dict, info: dict = None, parent=None):
+        super().__init__(parent)
+        self._name = name
+        self._preloaded = info or {}
+        self._info = None
+        # Если есть preloaded-данные — сразу готовы к установке
+        if self._preloaded:
+            self._info = {
+                "ver": self._preloaded.get("ver",""),
+                "profname": self._preloaded.get("profname", name),
+                "bannerpackname": self._preloaded.get("bannerpackname",""),
+                "desc": self._preloaded.get("desc",""),
+                "mods_count": self._preloaded.get("mods_count", 0),
+            }
+        t = theme
+        r, g, b = t["glow_rgb"]
+        self.setMinimumHeight(120)
+        self.setStyleSheet(f"""
+            ExpackCard{{background:{t["bg_panel2"]};border:1px solid {t["primary_dark"]};border-radius:12px;}}
+            ExpackCard:hover{{border-color:{t["accent"]};background:rgba({r},{g},{b},0.06);}}
+        """)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(12)
+
+        self._banner = QLabel()
+        self._banner.setFixedSize(80, 50)
+        self._banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._banner.setStyleSheet(f"background:{t['bg_panel']};border:1px solid {t['primary_dark']};border-radius:6px;")
+        self._banner.setPixmap(svg_pixmap("brush", 28, t["accent"]))
+        lay.addWidget(self._banner, 0)
+
+        info = QVBoxLayout()
+        info.setSpacing(4)
+        banner_title = self._preloaded.get("bannerpackname", name.replace("_", " ").title())
+        self._title = QLabel(banner_title)
+        self._title.setStyleSheet(f"color:{t['accent']};font:700 11pt '{F()}';background:transparent;")
+        info.addWidget(self._title)
+
+        pre_desc = self._preloaded.get("desc", "")
+        self._desc = QLabel(pre_desc[:120] if pre_desc else "Загрузка...")
+        self._desc.setWordWrap(True)
+        self._desc.setStyleSheet(f"color:{t['text_dim']};font:9pt '{F()}';background:transparent;")
+        info.addWidget(self._desc)
+
+        pre_ver = self._preloaded.get("ver", "?")
+        pre_prof = self._preloaded.get("profname", "?")
+        pre_mods = self._preloaded.get("mods_count", "?")
+        self._meta = QLabel(f"MC {pre_ver} · профиль: {pre_prof}" if self._preloaded else "")
+        self._meta.setStyleSheet(f"color:{t['accent_light']};font:8pt '{F()}';background:transparent;")
+        info.addWidget(self._meta)
+        info.addStretch()
+        lay.addLayout(info, 1)
+
+        btn = MD3Button("Установить", t, True, "download", 14)
+        btn.setFixedWidth(110)
+        btn.clicked.connect(lambda: self._install_flow())
+        lay.addWidget(btn, 0, Qt.AlignmentFlag.AlignVCenter)
+
+    def load_info(self):
+        """Фоновая загрузка .expack."""
+        if self._name in _EXPACK_CACHE:
+            self._apply_info(_EXPACK_CACHE[self._name])
+            return
+
+        class _ExpackLoader(QThread):
+            done = pyqtSignal(object)
+            def run(self):
+                try:
+                    url = EX_PACK_URL.format(name=self._name)
+                    req = urllib.request.Request(url, headers={"User-Agent": "ExelentLauncher/1.3"})
+                    with urllib.request.urlopen(req, timeout=30) as r:
+                        data = r.read()
+                    info = _parse_expack(data)
+                    if info:
+                        info["_raw"] = data
+                        info["_name"] = self._name
+                    self.done.emit(info)
+                except Exception as e:
+                    self.done.emit(None)
+
+        self._loader = _ExpackLoader()
+        self._loader.setObjectName(self._name)
+        self._loader.done.connect(self._on_loaded)
+        self._loader.start()
+
+    def _on_loaded(self, info):
+        if info:
+            _EXPACK_CACHE[self._name] = info
+            self._apply_info(info)
+        else:
+            self._desc.setText("Ошибка загрузки")
+
+    def _apply_info(self, info):
+        self._info = info
+        ver = info.get("ver", "?")
+        prof = info.get("profname", "?")
+        banner_name = info.get("bannerpackname", self._name)
+        self._title.setText(banner_name)
+        self._desc.setText(info.get("desc", "")[:200])
+        self._meta.setText(f"MC {ver} · {info.get('mods_count',0)} модов · профиль: {prof}")
+        if info.get("banner"):
+            pix = QPixmap()
+            pix.loadFromData(info["banner"])
+            if not pix.isNull():
+                self._banner.setPixmap(pix.scaled(80, 50, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+
+    def _install_flow(self):
+        if not hasattr(self, "_info") or not self._info:
+            QMessageBox.warning(self, "Ошибка", "Информация о сборке ещё не загружена.")
+            return
+        # Если нет _raw — пробуем докачать
+        if not self._info.get("_raw"):
+            self._desc.setText("Скачивание сборки...")
+            QApplication.processEvents()
+            try:
+                url = EX_PACK_URL.format(name=self._name)
+                req = urllib.request.Request(url, headers={"User-Agent": "ExelentLauncher/1.3"})
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    data = r.read()
+                parsed = _parse_expack(data)
+                if parsed:
+                    parsed["_raw"] = data
+                    parsed["_name"] = self._name
+                    self._info.update(parsed)
+                    self._apply_info(parsed)
+                else:
+                    QMessageBox.warning(self, "Ошибка",
+                    "Не удалось скачать сборку.\n\n"
+                    "Проверь что файл .expack запушен на GitHub: \n"
+                    "sborki/Optimized.expack")
+                    return
+            except Exception as e:
+                QMessageBox.warning(self, "Ошибка", f"Ошибка скачивания: {e}")
+                return
+        self.install_requested.emit(self._info)
+
+class ExpackBrowser(ThemedDialog):
+    """Окно каталога сборок."""
+
+    def __init__(self, theme: dict, mc_dir, online: bool, parent=None):
+        super().__init__(theme, "Каталог сборок", parent, width=800, height=600)
+        self._mc_dir = mc_dir
+        self._online = online
+        self._cards = []
+        self._build()
+
+    def _build(self):
+        t = self.theme
+
+        hdr = QLabel("Сборки модов с моего GitHub")
+        hdr.setStyleSheet(f"color:{t['accent']};font:700 12pt '{F()}';background:transparent;")
+        self.content_layout.addWidget(hdr)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet(f"QScrollArea{{background:transparent;border:none;}}{_sb_ss(t)}")
+        cw = QWidget()
+        cw.setStyleSheet("background:transparent;")
+        self._grid = QVBoxLayout(cw)
+        self._grid.setSpacing(8)
+        self._grid.setContentsMargins(0, 8, 0, 0)
+        self._grid.setAlignment(Qt.AlignmentFlag.AlignTop)
+        scroll.setWidget(cw)
+        self.content_layout.addWidget(scroll, 1)
+
+        if self._online:
+            packs = _fetch_expack_list()
+            if not packs:
+                packs = [{"name":"Optimized","ver":"1.21.11","profname":"Optimized",
+                          "bannerpackname":"Красота и оптимизация",
+                          "desc":"__Sodium__ + __Lithium__ + __Iris__"}]
+            for item in packs:
+                if isinstance(item, dict):
+                    name = item.get("name", "")
+                    info = item
+                else:
+                    name = str(item)
+                    info = {}
+                card = ExpackCard(name, t, info)
+                card.install_requested.connect(self._do_install)
+                self._grid.addWidget(card)
+                self._cards.append(card)
+                QTimer.singleShot(50 + len(self._cards)*30, card.load_info)
+        else:
+            no = QLabel("Нет интернета — каталог недоступен")
+            no.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            no.setStyleSheet(f"color:{t['text_dim']};font:11pt '{F()}';background:transparent;")
+            self._grid.addWidget(no)
+
+        close = MD3Button("Закрыть", t, False, "close", 14)
+        close.clicked.connect(self.reject)
+        self.add_button_row(close)
+
+    def _do_install(self, info):
+        """Установка сборки: создание профиля, установка версии, копирование модов."""
+        ver = info.get("ver", "")
+        profname = info.get("profname", "MyPack")
+        raw_data = info.get("_raw")
+        if not ver or not raw_data:
+            QMessageBox.critical(self, "Ошибка", "Нет данных сборки.")
+            return
+
+        # Создать профиль
+        mc_ver = ver
+        loader = "fabric"  # можно добавить в info.txt поддержку loader
+
+        # Проверить есть ли версия
+        try:
+            already = mc.is_version_installed(self._mc_dir, mc_ver)
+        except Exception:
+            already = False
+
+        if not already:
+            QMessageBox.information(self, "Установка",
+                "Сначала будет установлена MC " + mc_ver + ". " +
+                "Дождитесь завершения и повторите установку сборки. " +
+                "Совет: нажмите ИГРАТЬ на главном экране.")
+            return
+
+        # Создать профиль
+        try:
+            profiles_mod.create_profile(self._mc_dir, profname, mc_ver, loader, mc_ver)
+        except FileExistsError:
+            pass  # уже есть
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Профиль: {e}")
+            return
+
+        # Извлечь моды
+        try:
+            mods_dir = profiles_mod.mods_dir(self._mc_dir, profname)
+            with zipfile.ZipFile(io.BytesIO(raw_data)) as zf:
+                prefix = info.get("_prefix", "")
+                for f in zf.namelist():
+                    if f.endswith(".jar"):
+                        # Извлечь в mods_dir, убрав префикс папки
+                        target_name = f.replace(prefix, "") if prefix else f
+                        if "/" in target_name:
+                            target_name = target_name.split("/")[-1]
+                        target = mods_dir / target_name
+                        target.write_bytes(zf.read(f))
+            QMessageBox.information(self, "Готово",
+                "Сборка установлена! " +
+                "Профиль: " + profname + " " +
+                "Версия: " + mc_ver + " " +
+                "Моды в папке: " + str(mods_dir))
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", str(e))
 
 class SplashScreen(QWidget):
     """Безрамочная заставка с крутящимся item (easy-out)."""

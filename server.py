@@ -98,6 +98,18 @@ def get_icon_bytes(server_data: dict) -> bytes | None:
         return None
 
 
+def get_icon_pixmap(server_data: dict, size: int = 64):
+    """QPixmap from base64 server icon."""
+    from PyQt6.QtGui import QPixmap
+    data = get_icon_bytes(server_data)
+    if not data:
+        return None
+    pix = QPixmap()
+    pix.loadFromData(data)
+    if pix.isNull():
+        return None
+    return pix.scaled(size, size)
+
 def get_motd_text(server_data: dict) -> str:
     """Извлекает чистый MOTD (без цветовых кодов §)."""
     if not server_data:
@@ -110,6 +122,14 @@ def get_motd_text(server_data: dict) -> str:
         return clean.strip()
     return ""
 
+
+def get_version_text(server_data: dict) -> str:
+    if not server_data:
+        return ""
+    ver = server_data.get("version") or ""
+    if isinstance(ver, dict):
+        return ver.get("name", "")
+    return str(ver)
 
 def get_players_text(server_data: dict) -> str:
     """Возвращает '5 / 100' или '? / ?' если оффлайн."""

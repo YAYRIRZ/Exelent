@@ -55,10 +55,20 @@ class ProgressBar(QWidget):
         self.theme = theme
         self.update()
 
+    def shutdown(self):
+        try:
+            if self._timer and self._timer.isActive():
+                self._timer.stop()
+        except Exception:
+            pass
+
     def _tick(self) -> None:
-        self._t = (self._t + 0.016) % 1000.0
-        if self._indeterminate or 0 < self.value < 100 or self.value == 100:
-            self.update()
+        try:
+            self._t = (self._t + 0.016) % 1000.0
+            if self._indeterminate or 0 < self.value < 100 or self.value == 100:
+                self.update()
+        except (RuntimeError, Exception):
+            pass
 
     def paintEvent(self, _e) -> None:
         p = QPainter(self)

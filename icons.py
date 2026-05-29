@@ -9,11 +9,11 @@ from PyQt6.QtGui import QPixmap, QPainter, QIcon, QColor
 from PyQt6.QtSvg import QSvgRenderer
 
 
-_SVG_TEMPLATE = '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">{body}</svg>'
+_SVG_TEMPLATE = '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">%s</svg>'
 
 
 def _ic(body: str) -> str:
-    return _SVG_TEMPLATE.format(body=body)
+    return _SVG_TEMPLATE % body
 
 
 SVG: dict[str, str] = {
@@ -74,6 +74,8 @@ SVG: dict[str, str] = {
     "server_play": _ic('<path d="M5 3h14a2 2 0 012 2v14a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2zm5 5.5v7l6-3.5-6-3.5z" fill="{C}"/>'),
 
     # ─── Minecraft-themed ───
+        # КИСТОЧКА (для сборок)
+    "brush":          _ic('<path fill="{C}" d="M7 14c-1.66 0-3 1.34-3 3 0 1.31-1.16 2-2 2 .92 1.22 2.49 2 4 2 2.21 0 4-1.79 4-4 0-1.66-1.34-3-3-3zm13.71-9.37-1.34-1.34a.996.996 0 00-1.41 0L9 12.25 11.75 15l8.96-8.96a.996.996 0 000-1.41z"/>'),
     "sword":     _ic('<path d="M6.92 5L5 6.92 16.34 18.27 17 19l3-3-.73-.66L8 4l-1.08 1zm10.6 11.55l-1.41 1.42-9.9-9.9 1.41-1.42 9.9 9.9z" fill="{C}"/>'),
     "pickaxe":   _ic('<path d="M14 6l-2 2-7 7-3 3 2 2 3-3 7-7 2-2 4-4-2-2-4 4zm-9 13l-1-1 8-8 1 1-8 8z" fill="{C}"/>'),
     "shield":    _ic('<path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 10.99h7c-.53 4.12-3.28 7.79-7 8.94V12H5V6.3l7-3.11v8.8z" fill="{C}"/>'),
