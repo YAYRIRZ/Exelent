@@ -457,7 +457,7 @@ class BorderOverlay(QWidget):
         super().__init__(parent)
         self.theme = theme
         self.border = max(2, int(border))
-        self.radius = max(4, int(radius))
+        self.radius = max(0, int(radius))
         self._rb_phase = 0.0
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
@@ -476,7 +476,7 @@ class BorderOverlay(QWidget):
         self.update()
 
     def set_radius(self, r: int) -> None:
-        self.radius = max(4, int(r))
+        self.radius = max(0, int(r))
         self.update()
 
     def apply_theme(self, theme: dict) -> None:
@@ -522,8 +522,12 @@ class BorderOverlay(QWidget):
             brush = QBrush(bg)
 
         pen = QPen(brush, float(b))
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        if self.radius <= 0:
+            pen.setCapStyle(Qt.PenCapStyle.SquareCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
+        else:
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         p.setPen(pen)
         path = QPainterPath()
         path.addRoundedRect(rect, self.radius, self.radius)

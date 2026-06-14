@@ -517,14 +517,15 @@ class InstallThread(QThread):
                     "item":             "emerald",
                     "ui_style":         "classic",
                     "progress_style":   "bar",
+                    "square_corners":   False,
                     "first_run_done":   True,
                     "installed_at":     str(dst),
                     "assets_root":      str(dst / "assets" / "mc"),
                     # КЛЮЧЕВОЕ: версия структуры конфига и лаунчера.
                     # При обновлении лаунчер увидит config_version < CONFIG_VERSION
                     # и применит миграции, не теряя пользовательские настройки.
-                    "config_version":   2,
-                    "launcher_version": "1.31",
+                    "config_version":   3,
+                    "launcher_version": "1.4",
                 }
                 cfg_path.write_text(
                     json.dumps(default_cfg, indent=2, ensure_ascii=False),

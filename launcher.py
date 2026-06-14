@@ -49,8 +49,8 @@ CONFIG_FILE = APP_DIR / "config.json"
 FONTS_DIR   = APP_DIR / "fonts"
 BLOCKS_DIR  = APP_DIR / "assets" / "blocks"
 
-APP_VERSION       = "1.31"
-CONFIG_VERSION    = 2     # Версия структуры config.json (для миграций)
+APP_VERSION       = "1.4"
+CONFIG_VERSION    = 3     # Версия структуры config.json (для миграций)
 VERSION_CHECK_URL = ("https://raw.githubusercontent.com/"
                     "YAYRIRZ/SkyPluginsVersion/refs/heads/main/ExelentLauncher")
 TELEGRAM_CONTACT  = "t.me/YAYRIRZ"
@@ -77,6 +77,7 @@ DEFAULT_CONFIG = {
     "panel_position":   "bottom",
     "window_width":     1000,
     "window_height":    640,
+    "square_corners":   False,      # острые углы окна вместо скруглённых
     "background_path":  "",
     "background_blur":  False,
     "first_run_done":   False,
@@ -193,7 +194,17 @@ def load_config() -> dict:
         cfg.setdefault("progress_style", DEFAULT_CONFIG["progress_style"])
         migrated = True
 
-    # Будущие миграции: if user_ver < 3: ...
+    # v2 → v3: добавлен режим острых углов окна
+    if user_ver < 3:
+        # В раннем тестовом билде ключ назывался square_window. Если он уже
+        # попал пользователю — мягко переносим смысл в square_corners.
+        if "square_corners" not in cfg:
+            cfg["square_corners"] = bool(cfg.get("square_window", DEFAULT_CONFIG["square_corners"]))
+        migrated = True
+
+    cfg.setdefault("square_corners", DEFAULT_CONFIG["square_corners"])
+
+    # Будущие миграции: if user_ver < 4: ...
 
     cfg["config_version"] = CONFIG_VERSION
     cfg["launcher_version"] = APP_VERSION   # для информации
@@ -3098,6 +3109,10 @@ class SettingsDialog(ThemedDialog):
         self.height_sp.setRange(520, 1600)
         self.height_sp.setValue(int(self.cfg.get("window_height", 640)))
         self.height_sp.setSuffix(" px"); self.height_sp.setStyleSheet(iss)
+        self.square_cb = QCheckBox("Острые углы окна (квадратная форма)")
+        self.square_cb.setChecked(bool(self.cfg.get("square_corners", False)))
+        self.square_cb.setStyleSheet(iss)
+
         self.panel = QComboBox()
         for txt, dat in [("Снизу","bottom"),("Сверху","top"),
                          ("Слева","left"),("Справа","right")]:
@@ -3107,6 +3122,7 @@ class SettingsDialog(ThemedDialog):
         self.panel.setStyleSheet(iss)
         f2.addRow(self._lbl("Ширина:"), self.width_sp)
         f2.addRow(self._lbl("Высота:"), self.height_sp)
+        f2.addRow(self._lbl("Форма:"), self.square_cb)
         f2.addRow(self._lbl("Панель:"), self.panel)
         lay.addLayout(f2)
 
@@ -3396,6 +3412,9 @@ class SettingsDialog(ThemedDialog):
             edit.setText(c.name())
 
     def _save(self):
+        win_w = int(self.width_sp.value())
+        win_h = int(self.height_sp.value())
+
         self.result_cfg.update({
             "ram_mb":          int(self.ram.value()),
             "show_snapshots":  self.snap.isChecked(),
@@ -3403,8 +3422,9 @@ class SettingsDialog(ThemedDialog):
             "ask_sodium":      self.ask_sodium_cb.isChecked(),
             "optimizedstart":  self.optimized_start_cb.isChecked(),
             "panel_position":  self.panel.currentData(),
-            "window_width":    int(self.width_sp.value()),
-            "window_height":   int(self.height_sp.value()),
+            "window_width":    win_w,
+            "window_height":   win_h,
+            "square_corners":  self.square_cb.isChecked(),
             "background_path": self.bg_edit.text().strip(),
             "background_blur": self.bg_blur.isChecked(),
             "theme":           self.theme_combo.currentData(),
@@ -3517,7 +3537,7 @@ class LauncherWindow(QWidget):
 
         # Толстая обводка ПОВЕРХ всего. Ширину берём из cfg.
         border_w = int(self.cfg.get("border_width", self.BORDER))
-        self._overlay = BorderOverlay(self.theme, border_w, self.RADIUS, self)
+        self._overlay = BorderOverlay(self.theme, border_w, self._window_radius(), self)
         self._overlay.setGeometry(self.rect())
         # КЛЮЧЕВОЕ: raise_() поднимает overlay над всеми дочерними виджетами,
         # включая sidebar в Lunar — рамка всегда поверх содержимого
@@ -3580,13 +3600,25 @@ class LauncherWindow(QWidget):
         except Exception:
             pass
 
+    def _frame_border(self) -> int:
+        """Текущая толщина кастомной рамки из конфига."""
+        try:
+            return max(0, int(self.cfg.get("border_width", self.BORDER)))
+        except Exception:
+            return self.BORDER
+
+    def _window_radius(self) -> int:
+        """Радиус внешней формы окна: 0 = острые квадратные углы."""
+        return 0 if self.cfg.get("square_corners", False) else self.RADIUS
+
     def paintEvent(self, _e):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        BW = self.BORDER
+        BW = self._frame_border()
         rect = QRectF(self.rect().adjusted(BW, BW, -BW, -BW))
         path = QPainterPath()
-        path.addRoundedRect(rect, self.RADIUS, self.RADIUS)
+        rad = self._window_radius()
+        path.addRoundedRect(rect, rad, rad)
 
         bg_path = self.cfg.get("background_path", "")
         if bg_path and Path(bg_path).exists():
@@ -3621,7 +3653,7 @@ class LauncherWindow(QWidget):
 
     def mousePressEvent(self, e):
         # Перетаскивание окна — только за верхнюю полосу заголовка
-        if e.button() == Qt.MouseButton.LeftButton and e.position().y() < (self.BORDER + 48):
+        if e.button() == Qt.MouseButton.LeftButton and e.position().y() < (self._frame_border() + 48):
             self._drag_pos = (e.globalPosition().toPoint()
                               - self.frameGeometry().topLeft())
 
@@ -4800,8 +4832,8 @@ class LauncherWindow(QWidget):
             save_config(self.cfg)
             self.theme = themes_mod.get_theme(
                 self.cfg.get("theme"), self.cfg.get("custom_colors", {}))
-            self.resize(int(self.cfg["window_width"]),
-                        int(self.cfg["window_height"]))
+            self.resize(int(self.cfg.get("window_width", 1000)),
+                        int(self.cfg.get("window_height", 640)))
             self._apply_icon()
             # Обновить стиль главного прогресс-бара
             if hasattr(self, "progress") and hasattr(self.progress, "setStyleName"):
@@ -4809,9 +4841,10 @@ class LauncherWindow(QWidget):
                     self.cfg.get("progress_style", "bar"))
             if hasattr(self, "_overlay"):
                 self._overlay.apply_theme(self.theme)
-                # Применяем новую ширину обводки
+                # Применяем новую ширину обводки и форму углов
                 new_b = int(self.cfg.get("border_width", self.BORDER))
                 self._overlay.set_border(new_b)
+                self._overlay.set_radius(self._window_radius())
             if self.theme.get("rainbow"):
                 if not self._rb_timer.isActive():
                     self._rb_timer.start(28)
@@ -4845,26 +4878,155 @@ class LauncherWindow(QWidget):
 
 # Популярные серверы (фолбэк если не загрузился список)
 _SERVER_BOOK = [
-    ("Hypixel",    "mc.hypixel.net"),
-    ("Mineland",   "mineland.net"),
-    ("ReallyWorld","reallyworld.ru"),
-    ("2b2t",       "2b2t.org"),
-    ("Wynncraft",  "play.wynncraft.com"),
+    # Упор на RU/offline-mode серверы. Все адреса храним как host:port,
+    # чтобы запуск из мониторинга сразу шёл с явным сервером.
+    ("ReallyWorld", "reallyworld.ru:25565"),
+    ("Mineland",    "mineland.net:25565"),
+    ("Cristalix",   "cristalix.net:25565"),
+    ("FunnyMC",     "funnymc.ru:25565"),
+    ("AresMine",    "aresmine.ru:25565"),
+    ("Hypixel",     "mc.hypixel.net:25565"),
+    ("2b2t",        "2b2t.org:25565"),
+    ("Wynncraft",   "play.wynncraft.com:25565"),
 ]
 
 SERVER_LIST_URL = "https://raw.githubusercontent.com/YAYRIRZ/Exelent/refs/heads/main/servers.json"
+POPULAR_SERVER_SOURCES = [
+    "https://gamemonitoring.net/minecraft/servers",
+    "https://gamemonitoring.ru/minecraft/servers",
+    "https://minecraft-mp.com/country/russia/",
+]
+
+def _clean_server_name(text: str) -> str:
+    """Чистит HTML/лишние пробелы в названии сервера."""
+    import html, re
+    text = re.sub(r"<[^>]+>", " ", text or "")
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:80] if text else "Minecraft Server"
+
+def _dedupe_servers(items: list, limit: int = 40) -> list:
+    out = []
+    seen = set()
+    for name, addr in items:
+        addr = server_mod.normalize_addr(str(addr or ""))
+        if not addr or "." not in addr:
+            continue
+        key = addr.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((_clean_server_name(str(name or addr)), addr))
+        if len(out) >= limit:
+            break
+    return out
+
+def _parse_server_list(data) -> list:
+    if isinstance(data, list) and data:
+        out = []
+        for s in data:
+            if isinstance(s, dict) and "name" in s and "ip" in s:
+                out.append((str(s["name"]), server_mod.normalize_addr(str(s["ip"]))))
+        return _dedupe_servers(out, 40)
+    return []
+
+def _parse_gamemonitoring_servers(page: str, limit: int = 35) -> list:
+    """Парсит таблицу gamemonitoring.* без сторонних библиотек."""
+    import re
+    found = []
+    # В SSR-HTML строки выглядят так:
+    # <a href="/minecraft/servers/1004017">Name</a> ... <div ... select-text">host:port</div>
+    pattern = re.compile(
+        r'href=["\']/minecraft/servers/\d+["\'][^>]*>(.*?)</a>.*?'
+        r'<div[^>]+class=["\'][^"\']*select-text[^"\']*["\'][^>]*>([^<]+)</div>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    for m in pattern.finditer(page or ""):
+        name = _clean_server_name(m.group(1))
+        addr = server_mod.normalize_addr(m.group(2))
+        if addr:
+            found.append((name, addr))
+        if len(found) >= limit:
+            break
+    return _dedupe_servers(found, limit)
+
+def _parse_minecraft_mp_servers(page: str, limit: int = 25) -> list:
+    """Парсит minecraft-mp.com/country/russia/ по кнопкам copy-address."""
+    import re, html
+    found = []
+    for m in re.finditer(r'data-clipboard-text=["\']([^"\']+)["\']', page or "", re.I):
+        addr = server_mod.normalize_addr(html.unescape(m.group(1)))
+        before = page[max(0, m.start() - 1200):m.start()]
+        title = ""
+        # Берём ближайший title="..." перед адресом или имя из h3.
+        titles = re.findall(r'title=["\']([^"\']+)["\']', before, re.I)
+        for cand in reversed(titles):
+            cand_clean = _clean_server_name(cand)
+            if cand_clean.lower() not in ("russia", "copy", "online", "offline"):
+                title = cand_clean
+                break
+        h3 = re.findall(r'<h3>\s*<a[^>]*>(.*?)</a>\s*</h3>', before, re.I | re.S)
+        if h3:
+            title = h3[-1]
+        found.append((_clean_server_name(title or addr.split(":", 1)[0]), addr))
+        if len(found) >= limit:
+            break
+    return _dedupe_servers(found, limit)
+
+def _fetch_web_popular_servers(limit: int = 40) -> list:
+    """Берёт популярные серверы с интернет-мониторингов и парсит их HTML."""
+    import urllib.request
+    items = []
+    for url in POPULAR_SERVER_SOURCES:
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": f"ExelentLauncher/{APP_VERSION} (+{TELEGRAM_CONTACT}) Mozilla/5.0",
+                    "Accept": "text/html,application/xhtml+xml",
+                })
+            with urllib.request.urlopen(req, timeout=6) as r:
+                page = r.read(350_000).decode("utf-8", "ignore")
+            if "gamemonitoring" in url:
+                items.extend(_parse_gamemonitoring_servers(page, limit))
+            elif "minecraft-mp" in url:
+                items.extend(_parse_minecraft_mp_servers(page, limit))
+            items = _dedupe_servers(items, limit)
+            if len(items) >= limit:
+                break
+        except Exception:
+            continue
+    return _dedupe_servers(items, limit)
 
 def _fetch_server_list() -> list:
-    """Динамическая загрузка списка серверов с GitHub."""
+    """Список серверов: парсим интернет-мониторинги, затем fallback local/GitHub."""
     import urllib.request, json
+
+    # Главное требование: популярные серверы берём с интернета, а не держим
+    # только статический список в коде.
+    web_items = _fetch_web_popular_servers(40)
+    if web_items:
+        # Добавим наши RU/offline-mode серверы в конец, если их нет в парсинге.
+        return _dedupe_servers(web_items + _SERVER_BOOK, 45)
+
+    # Локальный fallback для оффлайна/сбоев сайтов-мониторингов.
+    try:
+        local = APP_DIR / "servers.json"
+        if local.exists():
+            parsed = _parse_server_list(json.loads(local.read_text(encoding="utf-8")))
+            if parsed:
+                return parsed
+    except Exception:
+        pass
+
     try:
         req = urllib.request.Request(
             SERVER_LIST_URL,
-            headers={"User-Agent": "ExelentLauncher/1.3"})
+            headers={"User-Agent": f"ExelentLauncher/{APP_VERSION}"})
         with urllib.request.urlopen(req, timeout=8) as r:
-            data = json.loads(r.read().decode("utf-8"))
-            if isinstance(data, list) and data:
-                return [(s["name"], s["ip"]) for s in data if "name" in s and "ip" in s]
+            parsed = _parse_server_list(json.loads(r.read().decode("utf-8")))
+            if parsed:
+                return parsed
     except Exception:
         pass
     return _SERVER_BOOK
@@ -4878,6 +5040,7 @@ class ServerBrowserDialog(ThemedDialog):
         self._online = online
         self._threads = []
         self._cards = {}
+        self._server_connect = {}  # исходный addr -> нормальный host:port из API
         self._build()
 
     def _build(self):
@@ -4886,41 +5049,42 @@ class ServerBrowserDialog(ThemedDialog):
         hrow = QHBoxLayout()
         hrow.setSpacing(8)
         self._addr = QLineEdit()
-        self._addr.setPlaceholderText("Server IP...")
+        self._addr.setPlaceholderText("IP или домен сервера (например: mc.example.ru:25565)...")
         self._addr.setStyleSheet(_input_ss(t))
         self._addr.returnPressed.connect(self._check_custom)
         hrow.addWidget(self._addr, 1)
-        check_btn = MD3Button("Check", t, True, "search", 15)
+        check_btn = MD3Button("Проверить", t, True, "search", 15)
         check_btn.clicked.connect(self._check_custom)
         hrow.addWidget(check_btn)
         self.content_layout.addLayout(hrow)
+
+        hdr = QLabel("Мониторинг серверов:")
+        hdr.setStyleSheet(f"color:{t['accent']};font:700 10pt '{F()}';background:transparent;")
+        self.content_layout.addWidget(hdr)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setStyleSheet(f"QScrollArea{{background:transparent;border:none;}}{_sb_ss(t)}")
         cw = QWidget()
         cw.setStyleSheet("background:transparent;")
-        self._grid = QGridLayout(cw)
+        self._grid = QVBoxLayout(cw)
         self._grid.setSpacing(10)
         self._grid.setContentsMargins(0, 8, 0, 0)
         self._grid.setAlignment(Qt.AlignmentFlag.AlignTop)
         scroll.setWidget(cw)
         self.content_layout.addWidget(scroll, 1)
 
-        hdr = QLabel("Popular servers:")
-        hdr.setStyleSheet(f"color:{t['accent']};font:700 10pt '{F()}';background:transparent;")
-        self.content_layout.addWidget(hdr)
-
         for idx, (name, addr) in enumerate(_fetch_server_list()):
             card = self._make_server_card(name, addr)
-            self._grid.addWidget(card, idx // 2, idx % 2)
+            self._grid.addWidget(card)
             self._cards[addr] = card
+            self._server_connect[addr] = server_mod.normalize_addr(addr)
             th = server_mod.ServerStatusThread(addr)
             th.done.connect(lambda a, d, n=name, c=card: self._update_card(n, c, d))
             th.start()
             self._threads.append(th)
 
-        close = MD3Button("Close", t, False, "close", 14)
+        close = MD3Button("Закрыть", t, False, "close", 14)
         close.clicked.connect(self.reject)
         self.add_button_row(close)
 
@@ -4965,7 +5129,7 @@ class ServerBrowserDialog(ThemedDialog):
         info.addWidget(pl)
         lay.addLayout(info, 1)
 
-        pb = MD3Button("PLAY", t, True, "play", 14)
+        pb = MD3Button("ИГРАТЬ", t, True, "play", 14)
         pb.setFixedWidth(80)
         pb.clicked.connect(lambda _=False, a=addr: self._join_server(a))
         pb.setObjectName(f"btn_{addr}")
@@ -4980,7 +5144,7 @@ class ServerBrowserDialog(ThemedDialog):
             ver = server_mod.get_version_text(data)
             pix = server_mod.get_icon_pixmap(data, 48)
         else:
-            motd = "Offline"
+            motd = "Оффлайн"
             players = "offline"
             ver = ""
             pix = None
@@ -4992,6 +5156,9 @@ class ServerBrowserDialog(ThemedDialog):
                 break
         if addr_key is None:
             return
+
+        if data and hasattr(server_mod, "get_connect_address"):
+            self._server_connect[addr_key] = server_mod.get_connect_address(data, addr_key)
 
         for child in card.findChildren(QLabel):
             oname = child.objectName()
@@ -5010,20 +5177,23 @@ class ServerBrowserDialog(ThemedDialog):
         if not addr:
             return
         card = self._make_server_card(addr, addr)
-        cnt = self._grid.count()
-        self._grid.addWidget(card, cnt // 2, cnt % 2)
+        self._grid.addWidget(card)
         self._cards[addr] = card
+        self._server_connect[addr] = server_mod.normalize_addr(addr)
         th = server_mod.ServerStatusThread(addr)
         th.done.connect(lambda a, d, n=addr, c=card: self._update_card(n, c, d))
         th.start()
         self._threads.append(th)
 
     def _join_server(self, addr: str):
+        # Всегда запускаем с явным host:port — это то, что дальше уйдёт в
+        # minecraft.py как --server/--port (эквивалентно -server host:port).
+        addr = self._server_connect.get(addr) or server_mod.normalize_addr(addr)
         win = self.parent()
         while win and not isinstance(win, LauncherWindow):
             win = win.parent()
         if win is None:
-            QMessageBox.information(self, "Error", "Main window not found.")
+            QMessageBox.information(self, "Ошибка", "Главное окно не найдено.")
             return
 
         win._save_nick()
@@ -5033,8 +5203,8 @@ class ServerBrowserDialog(ThemedDialog):
         except Exception:
             already = False
         if not already:
-            QMessageBox.information(self, "Not installed",
-                                    f"Version {target} not installed.")
+            QMessageBox.information(self, "Версия не установлена",
+                                    f"Версия {target} не установлена.")
             return
 
         need_java = LauncherWindow._required_java(target)
@@ -5087,7 +5257,7 @@ class ServerBrowserDialog(ThemedDialog):
             except Exception:
                 pass
 
-        win.dl_label.setText(f"Launch → {addr}...")
+        win.dl_label.setText(f"Запуск → {addr}...")
         win.progress.setValue(100)
         win.btn_play.setEnabled(False)
 
@@ -5130,7 +5300,7 @@ def _fetch_expack_list() -> list:
     import urllib.request, json
     url = "https://raw.githubusercontent.com/YAYRIRZ/Exelent/refs/heads/main/sborki/list.json"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "ExelentLauncher/1.3"})
+        req = urllib.request.Request(url, headers={"User-Agent": f"ExelentLauncher/{APP_VERSION}"})
         with urllib.request.urlopen(req, timeout=8) as r:
             data = json.loads(r.read().decode("utf-8"))
             if isinstance(data, list):
@@ -5230,7 +5400,7 @@ class _BannerLoader(QThread):
     def run(self):
         try:
             url = EX_BANNER_URL.format(name=self._name)
-            req = urllib.request.Request(url, headers={"User-Agent": "ExelentLauncher/1.3"})
+            req = urllib.request.Request(url, headers={"User-Agent": f"ExelentLauncher/{APP_VERSION}"})
             with urllib.request.urlopen(req, timeout=15) as r:
                 data = r.read()
             self.done.emit(self._name, data)
@@ -5426,7 +5596,7 @@ class ExpackCard(QFrame):
             def run(self_):
                 try:
                     url = EX_PACK_URL.format(name=outer_name)
-                    req = urllib.request.Request(url, headers={"User-Agent": "ExelentLauncher/1.3"})
+                    req = urllib.request.Request(url, headers={"User-Agent": f"ExelentLauncher/{APP_VERSION}"})
                     with urllib.request.urlopen(req, timeout=30) as r:
                         data = r.read()
                     info = _parse_expack(data)
@@ -5484,7 +5654,7 @@ class ExpackCard(QFrame):
             QApplication.processEvents()
             try:
                 url = EX_PACK_URL.format(name=self._name)
-                req = urllib.request.Request(url, headers={"User-Agent": "ExelentLauncher/1.3"})
+                req = urllib.request.Request(url, headers={"User-Agent": f"ExelentLauncher/{APP_VERSION}"})
                 with urllib.request.urlopen(req, timeout=60) as r:
                     data = r.read()
                 parsed = _parse_expack(data)

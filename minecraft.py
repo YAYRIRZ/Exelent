@@ -242,7 +242,7 @@ def download_portable_java(launcher_root: Path, major: int,
 
     try:
         req = urllib.request.Request(
-            url, headers={"User-Agent": "ExelentLauncher/1.2"})
+            url, headers={"User-Agent": "ExelentLauncher/1.4"})
         # Adoptium делает 307 redirect на github
         with urllib.request.urlopen(req, timeout=30) as r:
             # Угадываем расширение из URL после редиректа
@@ -359,9 +359,9 @@ def find_or_install_java(launcher_root: Path, required_major: int,
 #  Запуск + переименование окна Minecraft
 # ═══════════════════════════════════════════════════════════════
 
-WINDOW_TITLE   = "Exelent Client 1.2"
+WINDOW_TITLE   = "Exelent Client 1.4"
 LAUNCHER_BRAND = "Exelent Client"
-LAUNCHER_VER   = "1.2"
+LAUNCHER_VER   = "1.4"
 
 
 def _get_child_pids(root_pid: int) -> set[int]:
@@ -543,6 +543,43 @@ def _rename_minecraft_window(root_pid: int, new_title: str = WINDOW_TITLE,
         time.sleep(scan_interval)
 
 
+def normalize_server_target(server: str, default_port: str = "25565") -> tuple[str, str, str]:
+    """Возвращает (host, port, host:port) для автоподключения к серверу.
+
+    Поддерживает ввод из мониторинга: domain, domain:port, minecraft://domain:port.
+    Для IPv6 с портом используйте формат [::1]:25565.
+    """
+    raw = (server or "").strip()
+    for prefix in ("minecraft://", "mc://"):
+        if raw.lower().startswith(prefix):
+            raw = raw[len(prefix):]
+            break
+    raw = raw.strip().strip("/").split("/", 1)[0].split("?", 1)[0].strip()
+    if not raw:
+        return "", str(default_port), ""
+
+    port = str(default_port or "25565")
+
+    if raw.startswith("[") and "]" in raw:
+        host, rest = raw.split("]", 1)
+        host = host + "]"
+        if rest.startswith(":") and rest[1:]:
+            port = rest[1:]
+        return host, port, f"{host}:{port}"
+
+    if raw.count(":") == 1:
+        host, maybe_port = raw.rsplit(":", 1)
+        if host and maybe_port.isdigit():
+            port = maybe_port
+            return host, port, f"{host}:{port}"
+
+    # Если это IPv6 без [] — не разбираем порт, передаём как host.
+    if ":" in raw:
+        return raw, port, raw
+
+    return raw, port, f"{raw}:{port}"
+
+
 def launch_minecraft(version: str, username: str, mc_dir: Path, ram_mb: int = 2048,
                      java_path: Optional[str] = None, dev_mode: bool = False,
                      game_dir: Optional[Path] = None,
@@ -583,16 +620,29 @@ def launch_minecraft(version: str, username: str, mc_dir: Path, ram_mb: int = 20
     if java_path:
         options["executablePath"] = java_path
 
-    # Автоподключение к серверу
+    # Автоподключение к серверу из мониторинга. Внутри Minecraft корректный
+    # формат — --server <host> --port <port>; в UI и конфиге храним host:port
+    # (то, что обычно называют запуском через -server IP:Port).
+    server_host = server_port = server_full = ""
     if server:
-        host = server.strip()
-        port = "25565"
-        if ":" in host:
-            host, port = host.rsplit(":", 1)
-        options["server"] = host
-        options["port"]   = port
+        server_host, server_port, server_full = normalize_server_target(server)
+        if server_host:
+            options["server"] = server_host
+            options["port"] = server_port
+            # Для новых версий, если version.json поддерживает quick play.
+            options["quickPlayMultiplayer"] = server_full
 
     cmd = mll.command.get_minecraft_command(version, str(mc_dir), options)
+
+    # Страховка для разных версий minecraft-launcher-lib/version.json:
+    # если библиотека не добавила параметры сервера, добавляем их вручную.
+    if server_host:
+        has_server_arg = any(str(x) in ("--server", "-server") for x in cmd)
+        has_port_arg = any(str(x) in ("--port", "-port") for x in cmd)
+        if not has_server_arg:
+            cmd += ["--server", server_host]
+        if not has_port_arg:
+            cmd += ["--port", str(server_port or "25565")]
 
     stdout = None if dev_mode else subprocess.DEVNULL
     stderr = None if dev_mode else subprocess.DEVNULL

@@ -1,10 +1,18 @@
 [
-  {"name": "Hypixel",     "ip": "mc.hypixel.net"},
-  {"name": "Mineland",    "ip": "mineland.net"},
-  {"name": "ReallyWorld", "ip": "reallyworld.ru"},
-  {"name": "2b2t",        "ip": "2b2t.org"},
-  {"name": "Wynncraft",   "ip": "play.wynncraft.com"},
-  {"name": "Cristalix",   "ip": "cristalix.net"},
-  {"name": "FunnyMC",     "ip": "funnymc.ru"},
-  {"name": "AresMine",    "ip": "aresmine.ru"}
+  {"name": "MigosMc",       "ip": "game.migosmc.net:25565"},
+  {"name": "ReallyWorld",    "ip": "reallyworld.ru:25565"},
+  {"name": "Mineland",       "ip": "mineland.net:25565"},
+  {"name": "Cristalix",      "ip": "cristalix.net:25565"},
+  {"name": "FunnyMC",        "ip": "funnymc.ru:25565"},
+  {"name": "AresMine",       "ip": "aresmine.ru:25565"},
+  {"name": "Jam Hardcore",   "ip": "mc.jamhardcore.org:25565"},
+  {"name": "EpiCraft SMP",   "ip": "mc.epicraft.ru:25506"},
+  {"name": "Xenolith",       "ip": "mc.xenolith.ru:25565"},
+  {"name": "GrandRay",       "ip": "play.grandray.net:25565"},
+  {"name": "JustMC",         "ip": "play.justmc.io:25565"},
+  {"name": "Key World",      "ip": "kwrb.ru:25565"},
+  {"name": "102Arena",       "ip": "mc.102arena.ru:25565"},
+  {"name": "Hypixel",        "ip": "mc.hypixel.net:25565"},
+  {"name": "2b2t",           "ip": "2b2t.org:25565"},
+  {"name": "Wynncraft",      "ip": "play.wynncraft.com:25565"}
 ]
